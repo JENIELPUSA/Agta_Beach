@@ -1,0 +1,8 @@
+Back-End/config.env
+Front-End/.env
+Front-End/node_modules
+Back-End/node_modules
+Back-End/serviceAccountKey.json
+bfg-1.14.0.jar
+uploads
+Front-End
