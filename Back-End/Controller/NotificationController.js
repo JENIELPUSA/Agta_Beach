@@ -19,29 +19,40 @@ exports.createNotification = AsyncErrorHandler(async (req, res) => {
   });
 });
 
+// Notification Controller
 exports.getByLinkId = AsyncErrorHandler(async (req, res) => {
   const { linkId } = req.params;
-  const { limit } = req.query;
+  const { limit, page } = req.query;
 
-  // Default limit = 5, unless limit=all
-  let queryLimit = 5;
-  if (limit && limit.toLowerCase() === "all") {
-    queryLimit = 0; // 0 means walang limit sa MongoDB
-  }
-
-  const notificationsQuery = Notification.find({
-    "viewers.user": linkId,
-  }).sort({ createdAt: -1 });
-
-  if (queryLimit > 0) {
-    notificationsQuery.limit(queryLimit);
-  }
-
-  const notifications = await notificationsQuery;
-
+  const query = { "viewers.user": linkId };
+  
+  // Pagination
+  const currentPage = parseInt(page) || 1;
+  let itemsPerPage = parseInt(limit) || 10;
+  if (itemsPerPage > 50) itemsPerPage = 50;
+  
+  const skip = (currentPage - 1) * itemsPerPage;
+  const totalCount = await Notification.countDocuments(query);
+  
+  const notifications = await Notification.find(query)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(itemsPerPage);
+  
+  const hasMore = (skip + notifications.length) < totalCount;
+  
   res.status(200).json({
     status: "success",
-    data: notifications,
+    data: {
+      notifications,
+      pagination: {
+        currentPage,
+        itemsPerPage,
+        totalCount,
+        hasMore,
+        nextPage: hasMore ? currentPage + 1 : null
+      }
+    }
   });
 });
 

@@ -20,6 +20,8 @@ const CustomerRoute = require("./Routes/CustomerRoute");
 
 const ApproverRoute = require("./Routes/ApproverRoute");
 
+const BookingRoute = require("./Routes/ActionBookingRoute");
+
 const OfferServiceRoute = require("./Routes/OfferServiceRoute");
 
 let app = express();
@@ -53,7 +55,7 @@ app.use(
 app.use(
   cors({
     origin: process.env.FRONTEND_URL,
-    methods: ["GET", "POST", "PATCH", "DELETE"],
+    methods: ["GET", "POST", "PATCH", "DELETE","PUT"],
     credentials: true,
   }),
 );
@@ -67,7 +69,9 @@ if (process.env.NODE_ENV === "development") {
 
 const uploadsDir = path.join(__dirname, "..", "uploads");
 
+
 app.use("/uploads", express.static(uploadsDir));
+app.use("/api/v1/bookings", BookingRoute);
 app.use("/api/v1/authentication", authentic);
 app.use("/api/v1/Admin", AdminRoute);
 app.use("/api/v1/Notification", Notification);

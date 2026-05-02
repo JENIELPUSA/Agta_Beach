@@ -5,6 +5,75 @@ const Accommodation = require("../Models/accommodationSchema");
 const Service = require("../Models/serviceSchema ");
 const Rental = require("../Models/rentalSchema");
 const BookingItem = require("../Models/bookingItemSchema");
+const ActionBookingScheema = require("../Models/ActionBooking");
+
+exports.displayAllLimitOffers = async (req, res) => {
+  try {
+    // =========================
+    // 1. GET ALL PAID BOOKINGS
+    // =========================
+    const paidBookings = await ActionBookingScheema.find({
+      status: "Paid",
+    }).select("bookingItemId bookingItemModel");
+
+    // Convert to easy lookup
+    const paidMap = new Map();
+
+    paidBookings.forEach((item) => {
+      paidMap.set(item.bookingItemId.toString(), item.bookingItemModel);
+    });
+
+    // =========================
+    // 2. FETCH DATA
+    // =========================
+    const [accommodations, services, rentals] = await Promise.all([
+      Accommodation.find({ type: "room" }).sort({ createdAt: -1 }).limit(4),
+      Service.find().sort({ createdAt: -1 }).limit(8),
+      Rental.find().sort({ createdAt: -1 }),
+    ]);
+
+    // =========================
+    // 3. APPLY STATUS LOGIC
+    // =========================
+    const updateStatus = (items, modelName) => {
+      return items.map((item) => {
+        const isPaid = paidMap.has(item._id.toString()) &&
+                       paidMap.get(item._id.toString()) === modelName;
+
+        return {
+          ...item._doc,
+          availabilityStatus: isPaid ? "Not Available" : "Available",
+        };
+      });
+    };
+
+    const updatedAccommodations = updateStatus(accommodations, "Accommodation");
+    const updatedServices = updateStatus(services, "Service");
+    const updatedRentals = updateStatus(rentals, "Rental");
+
+    res.status(200).json({
+      success: true,
+      count: {
+        accommodations: updatedAccommodations.length,
+        services: updatedServices.length,
+        rentals: updatedRentals.length,
+      },
+      data: {
+        accommodations: updatedAccommodations,
+        services: updatedServices,
+        rentals: updatedRentals,
+      },
+    });
+
+  } catch (error) {
+    console.error("❌ Server Error:", error);
+    res.status(500).json({
+      success: false,
+      message: "May error sa pag-retrieve ng data.",
+      error: error.message,
+    });
+  }
+};
 
 // Helper function para linisin ang undefined fields
 const removeEmptyFields = (obj) => {
@@ -193,34 +262,4 @@ exports.displayAllOffersController = async (req, res) => {
   }
 };
 
-exports.displayAllLimitOffers = async (req, res) => {
-  try {
-    const [accommodations, services, rentals] = await Promise.all([
-      Accommodation.find({ type: "room" }).sort({ createdAt: -1 }).limit(4),
-      Service.find().sort({ createdAt: -1 }).limit(8),
 
-      Rental.find().sort({ createdAt: -1 }),
-    ]);
-
-    res.status(200).json({
-      success: true,
-      count: {
-        accommodations: accommodations.length,
-        services: services.length,
-        rentals: rentals.length,
-      },
-      data: {
-        accommodations,
-        services,
-        rentals,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Server Error:", error);
-    res.status(500).json({
-      success: false,
-      message: "May error sa pag-retrieve ng data.",
-      error: error.message,
-    });
-  }
-};

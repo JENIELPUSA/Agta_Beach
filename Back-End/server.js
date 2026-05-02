@@ -6,15 +6,11 @@ const http = require("http");
 const socketIo = require("socket.io");
 const app = require("./app");
 const initDefaultUser = require("./Controller/initDefaultUser");
+const UserLogin = require("./Models/LogInDentalSchema");
 
+const OFFLINE_DELAY = process.env.OFFLINE_DELAY || 5000;
 
 app.set("trust proxy", true);
-
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception! Shutting down...");
-  console.error(err);
-  process.exit(1);
-});
 
 const server = http.createServer(app);
 
@@ -24,72 +20,57 @@ const io = socketIo(server, {
     methods: ["GET", "POST"],
     credentials: true,
   },
-  transports: ["websocket"],
-  pingInterval: 25000,
-  pingTimeout: 60000,
 });
 
-app.set("io", io);
-
-global.connectedUsers = {};
-let messageCount = 0;
+app.set("socketio", io); // ✅ IMPORTANT (use same key)
 
 io.on("connection", (socket) => {
-  console.log("New client connected:", socket.id);
+  console.log("🔌 Connected:", socket.id);
 
-  socket.on("register-user", (linkId, role) => {
-    global.connectedUsers[linkId] = {
-      socketId: socket.id,
-      role,
-    };
-    console.log(
-      `Registered ${role} with linkId ${linkId} => socket ${socket.id}`
-    );
-  });
+  socket.on("register-user", async (userId, role) => {
+    if (!userId || !role) return;
 
-  socket.on("newRequest", (data) => {
-    messageCount++;
-    console.log("New request received:", data);
+    const normalizedRole = role.toLowerCase();
 
-    const { doctor_id } = data;
-    const message = {
-      message: "A new request has been added!",
-      data,
-      count: messageCount,
-    };
+    socket.userId = userId;
+    socket.role = normalizedRole;
 
-    for (const linkId in global.connectedUsers) {
-      const { socketId, role } = global.connectedUsers[linkId];
+    // =====================================
+    // 🧩 ROLE ROOM (existing logic)
+    // =====================================
+    socket.join(normalizedRole);
 
-      if (
-        (doctor_id &&
-          (role === "admin" || role === "officer" || linkId === doctor_id)) ||
-        (!doctor_id && role === "officer")
-      ) {
-        io.to(socketId).emit("adminNotification", message);
-        io.to(socketId).emit("SMSNotification", message);
-      }
+    // =====================================
+    // 👤 PRIVATE ROOM (SENDER ONLY)
+    // =====================================
+    socket.join(`user-${userId}`);
+
+    // =====================================
+    // 🛡️ ADMIN ROOM
+    // =====================================
+    if (normalizedRole === "admin") {
+      socket.join("admin");
     }
-  });
 
-  socket.on("RefreshData", () => {
-    console.log("RefreshData triggered");
-    socket.emit("refreshRequests");
-  });
-  socket.on("clearNotifications", () => {
-    messageCount = 0;
-    io.emit("notificationCountReset", { count: 0 });
+    // =====================================
+    // 🧾 RECEPTIONIST ROOM
+    // =====================================
+    if (normalizedRole === "receptionist") {
+      socket.join("receptionist");
+    }
+
+    console.log(`✅ Registered ${userId} (${normalizedRole})`);
+    console.log("📦 Rooms:", [...socket.rooms]);
   });
 
   socket.on("disconnect", () => {
-    console.log("Disconnected:", socket.id);
-
-    for (const linkId in global.connectedUsers) {
-      if (global.connectedUsers[linkId].socketId === socket.id) {
-        delete global.connectedUsers[linkId];
-        console.log(`Removed user ${linkId} from connectedUsers`);
-        break;
-      }
+    if (socket.userId) {
+      setTimeout(async () => {
+        await UserLogin.findByIdAndUpdate(socket.userId, {
+          status: "offline",
+        });
+        console.log(`💤 ${socket.userId} OFFLINE`);
+      }, OFFLINE_DELAY);
     }
   });
 });
@@ -97,25 +78,11 @@ io.on("connection", (socket) => {
 mongoose
   .connect(process.env.CONN_STR)
   .then(async () => {
-    console.log("✅ Database connected successfully");
-
+    console.log("✅ DB Connected");
     await initDefaultUser();
-  })
-  .catch((err) => {
-    console.error("❌ DB connection error:", err.message);
-    process.exit(1);
   });
-  
+
 const port = process.env.PORT || 8000;
 server.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`🚀 Server running on ${port}`);
 });
-
-process.on("unhandledRejection", (err) => {
-  console.error("Unhandled Rejection! Shutting down...");
-  console.error(err);
-  server.close(() => process.exit(1));
-});
-
-
-
