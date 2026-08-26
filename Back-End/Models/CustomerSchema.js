@@ -8,6 +8,7 @@ const customerSchema = new mongoose.Schema({
   first_name: String,
   last_name: String,
   middle_name: String,
+  suffix: String,
   gender: { type: String, enum: ["Male", "Female"] },
   email: String,
   created_at: { type: Date, default: Date.now },

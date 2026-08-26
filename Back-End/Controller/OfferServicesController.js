@@ -38,7 +38,7 @@ exports.displayAllLimitOffers = async (req, res) => {
     const updateStatus = (items, modelName) => {
       return items.map((item) => {
         const isPaid = paidMap.has(item._id.toString()) &&
-                       paidMap.get(item._id.toString()) === modelName;
+          paidMap.get(item._id.toString()) === modelName;
 
         return {
           ...item._doc,
@@ -126,7 +126,7 @@ exports.createOfferController = async (req, res) => {
       );
 
       try {
-        const response = await axios.post(process.env.UPLOAD_URL, form, {
+        const response = await axios.post(process.env.UPLOADAGTA_URL, form, {
           maxBodyLength: Infinity,
           headers: { ...form.getHeaders() },
         });
@@ -259,6 +259,70 @@ exports.displayAllOffersController = async (req, res) => {
   } catch (error) {
     console.error("❌ Server Error 500:", error);
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.dropdownDisplay = async (req, res) => {
+  try {
+    const [accommodations, services, rentals] = await Promise.all([
+      Accommodation.find()
+        .select('name type minCapacity maxCapacity pricePerDay')
+        .lean()
+        .sort({ createdAt: -1 }),
+      Service.find()
+        .select('name price')
+        .lean()
+        .sort({ createdAt: -1 }),
+      Rental.find()
+        .select('name price')
+        .lean()
+        .sort({ createdAt: -1 }),
+    ]);
+
+    // Format accommodations WITH type included
+    const formattedAccommodations = accommodations.map(item => ({
+      id: item._id,
+      type: item.type || 'N/A',
+      name: item.name,
+      minCapacity: item.minCapacity || 0,
+      maxCapacity: item.maxCapacity || 0,
+      pricePerDay: item.pricePerDay || 0,
+      label: `${item.name} (${item.type || 'N/A'}) - ${item.minCapacity || 0}-${item.maxCapacity || 0} guests - ₱${item.pricePerDay?.toLocaleString() || 0}/day`
+    }));
+
+    const formattedServices = services.map(item => ({
+      id: item._id,
+      name: item.name,
+      price: item.price || 0,
+      label: `${item.name} - ₱${item.price?.toLocaleString() || 0}`
+    }));
+
+    const formattedRentals = rentals.map(item => ({
+      id: item._id,
+      name: item.name,
+      price: item.price || 0,
+      label: `${item.name} - ₱${item.price?.toLocaleString() || 0}`
+    }));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        accommodations: formattedAccommodations,
+        services: formattedServices,
+        rentals: formattedRentals,
+      },
+      counts: {
+        accommodations: formattedAccommodations.length,
+        services: formattedServices.length,
+        rentals: formattedRentals.length,
+      }
+    });
+  } catch (error) {
+    console.error("❌ Server Error 500:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: error.message 
+    });
   }
 };
 

@@ -9,6 +9,10 @@ router
   .get(authController.protect, actionBookingController.getAllBookings)
   .post(authController.protect, actionBookingController.createBooking);
 
+  router
+  .route("/getMyBilling")
+  .get(authController.protect, actionBookingController.getMyBilling)
+
 router
   .route("/:id")
   .get(authController.protect, actionBookingController.getSingleBooking)

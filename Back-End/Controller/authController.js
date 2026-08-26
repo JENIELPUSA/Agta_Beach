@@ -11,6 +11,7 @@ const fs = require("fs");
 const FormData = require("form-data");
 const crypto = require("crypto");
 const sendEmail = require("./../Utils/email");
+const Cart = require("../Models/cartModel")
 const signToken = (id, role, linkId) => {
   return jwt.sign({ id, role, linkId }, process.env.SECRET_STR, {
     expiresIn: "12h",
@@ -191,68 +192,6 @@ Please change your password after logging in.`,
   }
 });
 
-exports.login = AsyncErrorHandler(async (req, res, next) => {
-  const { email, password } = req.body;
-
-  const user = await UserLogin.findOne({ username: email }).select("+password");
-
-  if (!user || !(await user.comparePasswordInDb(password, user.password))) {
-    return next(new CustomError("Incorrect email or password", 400));
-  }
-
-  if (!user.isVerified) {
-    return res.status(401).json({
-      message: "Please verify your email address before logging in.",
-    });
-  }
-
-  let linkId = user.linkedId || user._id;
-  let zone = user.Designatedzone;
-
-  if (user.role === "patient") {
-    const patient = await Patient.findOne({ user_id: user._id });
-    if (patient) {
-      linkId = patient._id;
-      zone = patient.zone;
-    }
-  }
-
-  // Optional: destroy old session to prevent multiple sessions per user
-  if (req.session.userId && req.session.userId !== user._id) {
-    req.session.destroy((err) => {
-      if (err) console.log("Failed to destroy old session:", err);
-    });
-  }
-
-  //Generate token with role and linkId
-  const token = signToken(user._id, user.role, linkId);
-
-  req.session.userId = user._id;
-  req.session.isLoggedIn = true;
-  req.session.user = {
-    email: user.username,
-    first_name: user.first_name,
-    last_name: user.last_name,
-    role: user.role,
-    Designatedzone: zone,
-    linkId,
-    theme: user.theme,
-  };
-
-  return res.status(200).json({
-    status: "Success",
-    userId: user._id,
-    linkId,
-    role: user.role,
-    token,
-    email: user.username,
-    Designatedzone: zone,
-    first_name: user.first_name,
-    last_name: user.last_name,
-    theme: user.theme,
-  });
-});
-
 exports.logout = AsyncErrorHandler((req, res, next) => {
   req.session.destroy((err) => {
     if (err) return res.status(500).send("Logout failed.");
@@ -299,7 +238,9 @@ exports.verifyOtp = AsyncErrorHandler(async (req, res, next) => {
 });
 
 exports.login = AsyncErrorHandler(async (req, res, next) => {
-  const { email, password } = req.body;
+  const { email, password, orderData } = req.body;
+
+  console.log("orderData", orderData);
 
   const user = await UserLogin.findOne({ username: email }).select("+password");
 
@@ -337,6 +278,161 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
     linkId,
   };
 
+  // ======================
+  // SAVE ORDER DATA TO CART ONLY
+  // ======================
+  let savedCart = null;
+  let errors = [];
+
+  if (orderData && orderData.items && orderData.items.length > 0) {
+    try {
+      console.log("📦 Processing cart data from login...");
+
+      // Import models
+      const Cart = require("../Models/cartModel");
+      const Food = require("../Models/FoodSchema");
+
+      // Validate food items and create cart items
+      const cartItems = [];
+      errors = [];
+
+      for (const item of orderData.items) {
+        try {
+          const foodId = item.foodId || item.id;
+          const food = await Food.findById(foodId);
+
+          if (!food) {
+            errors.push({
+              foodId: foodId,
+              error: `Food with ID ${foodId} not found.`,
+            });
+            continue;
+          }
+
+          if (food.status && food.status.toLowerCase() !== "available") {
+            errors.push({
+              foodId: foodId,
+              name: food.name,
+              error: `Food "${food.name}" is not available.`,
+            });
+            continue;
+          }
+
+          const quantity = item.quantity || 1;
+          if (food.stock !== undefined && food.stock !== null && food.stock < quantity) {
+            errors.push({
+              foodId: foodId,
+              name: food.name,
+              error: `Insufficient stock for "${food.name}". Available: ${food.stock}`,
+            });
+            continue;
+          }
+
+          cartItems.push({
+            foodId: food._id,
+            quantity: quantity,
+          });
+
+          // Deduct stock
+          if (food.stock !== undefined) {
+            food.stock -= quantity;
+            await food.save();
+          }
+        } catch (error) {
+          errors.push({
+            foodId: item.foodId || item.id,
+            error: error.message,
+          });
+        }
+      }
+
+      if (cartItems.length > 0) {
+        // ======================
+        // SAVE TO CART (WITH DUPLICATE HANDLING)
+        // ======================
+        let cart;
+
+        // Check for existing cart
+        const existingCart = await Cart.findOne({ customerId: user._id });
+
+        if (existingCart) {
+          console.log(`🔄 Found existing cart, updating...`);
+
+          // Check if existing cart has items
+          if (existingCart.items && existingCart.items.length > 0) {
+            // Merge items - add new items or update quantities
+            for (const newItem of cartItems) {
+              const existingItemIndex = existingCart.items.findIndex(
+                item => item.foodId.toString() === newItem.foodId.toString()
+              );
+
+              if (existingItemIndex !== -1) {
+                // Update quantity of existing item
+                existingCart.items[existingItemIndex].quantity += newItem.quantity;
+              } else {
+                // Add new item
+                existingCart.items.push(newItem);
+              }
+            }
+          } else {
+            // Replace empty items with new items
+            existingCart.items = cartItems;
+          }
+
+          // Update timestamps
+          existingCart.created_at = new Date();
+
+          cart = existingCart;
+          await cart.save();
+          console.log("✅ Cart updated successfully");
+        } else {
+          // No existing cart - create new one
+          console.log("🆕 Creating new cart for user:", user._id);
+          cart = new Cart({
+            customerId: user._id,
+            items: cartItems,
+            created_at: new Date(),
+          });
+          await cart.save();
+          console.log("✅ New cart created successfully");
+        }
+
+        // Get populated cart for response
+        const populatedCart = await Cart.findOne({ customerId: user._id })
+          .populate('items.foodId', 'name price image category');
+
+        savedCart = {
+          _id: populatedCart._id,
+          items: populatedCart.items.map(item => ({
+            foodId: item.foodId._id,
+            name: item.foodId.name,
+            price: item.foodId.price,
+            image: item.foodId.image || '',
+            category: item.foodId.category || '',
+            quantity: item.quantity,
+          })),
+          totalItems: populatedCart.items.reduce((sum, item) => sum + item.quantity, 0),
+          totalPrice: populatedCart.items.reduce((sum, item) => sum + (item.foodId.price * item.quantity), 0),
+        };
+
+        console.log("✅ Cart saved during login:", savedCart);
+
+        // Log any errors (non-blocking)
+        if (errors.length > 0) {
+          console.warn("⚠️ Cart creation warnings:", errors);
+        }
+      } else {
+        console.warn("⚠️ No valid items in order data, cart not created.");
+      }
+    } catch (error) {
+      console.error("❌ Failed to process cart during login:", error);
+      // Don't block login, just log the error
+    }
+  }
+
+  // ======================
+  // RETURN RESPONSE
+  // ======================
   return res.status(200).json({
     status: "Success",
     userId: user._id,
@@ -347,6 +443,12 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
     Designatedzone: zone,
     first_name: user.first_name,
     last_name: user.last_name,
+    // Include cart data if created
+    ...(savedCart && { cart: savedCart }),
+    // Include errors if any (non-blocking)
+    ...(orderData && orderData.items && orderData.items.length > 0 && {
+      cartWarnings: errors || []
+    }),
   });
 });
 
@@ -372,7 +474,7 @@ exports.protect = AsyncErrorHandler(async (req, res, next) => {
   // 3. Verify JWT token
   const decoded = await util.promisify(jwt.verify)(
     token,
-    process.env.SECRET_STR,
+    process.env.SECRET_STR
   );
 
   const user = await UserLogin.findById(decoded.id);
@@ -387,11 +489,11 @@ exports.protect = AsyncErrorHandler(async (req, res, next) => {
   }
 
   // 5. Set linkedId and assign user to req.user
-  const linkId = user.linkedId || user._id;
+  const linkId = user.linkedId;
 
   req.user = {
     _id: user._id,
-    email: user.email,
+    email: user.username,
     role: user.role,
     first_name: user.first_name,
     last_name: user.last_name,

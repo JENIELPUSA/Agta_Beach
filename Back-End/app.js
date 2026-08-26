@@ -24,6 +24,15 @@ const BookingRoute = require("./Routes/ActionBookingRoute");
 
 const OfferServiceRoute = require("./Routes/OfferServiceRoute");
 
+const OrderRoute = require("./Routes/OrderRoute")
+
+const CardRoute = require("./Routes/cartRoute")
+
+const BillingHistoryRoute = require("./Routes/BillingHistoryRoute")
+
+const StatisticalRoute = require("./Routes/StatisticalRoute")
+
+const FoodRoute = require("./Routes/FoodRoute")
 let app = express();
 
 const logger = function (req, res, next) {
@@ -55,7 +64,7 @@ app.use(
 app.use(
   cors({
     origin: process.env.FRONTEND_URL,
-    methods: ["GET", "POST", "PATCH", "DELETE","PUT"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "PUT"],
     credentials: true,
   }),
 );
@@ -79,7 +88,11 @@ app.use("/api/v1/SbmemberRoute", SbmemberRoute);
 app.use("/api/v1/Approver", ApproverRoute);
 app.use("/api/v1/Customer", CustomerRoute);
 app.use("/api/v1/OfferService", OfferServiceRoute);
-
+app.use("/api/v1/foods", FoodRoute);
+app.use("/api/v1/orders", OrderRoute);
+app.use("/api/v1/cartFood", CardRoute);
+app.use("/api/v1/billing", BillingHistoryRoute);
+app.use("/api/v1/statistical", StatisticalRoute);
 
 
 app.use(ErrorController);

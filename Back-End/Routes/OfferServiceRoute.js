@@ -23,4 +23,8 @@ router
   .route("/displayAllLimitOffers")
   .get(OfferServicesController.displayAllLimitOffers);
 
+router
+  .route("/dropdownrental")
+  .get(authController.protect, OfferServicesController.dropdownDisplay);
+
 module.exports = router;
