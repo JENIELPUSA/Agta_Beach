@@ -119,71 +119,105 @@ exports.createFood = AsyncErrorHandler(async (req, res) => {
     });
 });
 
-// ======================
-// DISPLAY FOODS (WITH CATEGORY LIST FOR FILTER)
-// ======================
+// controllers/foodController.js
+
 exports.DisplayFood = AsyncErrorHandler(async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 10;
-        const skip = (page - 1) * limit;
+    // ─── 1. Extract & sanitize query params ─────────────────────────
+    const {
+        search = "",
+        page = 1,
+        limit = 10,
+        category,      // ← CATEGORY FILTER
+        status,
+        sortBy = "createdAt",
+        sortOrder = "desc",
+    } = req.query;
 
-        const { search = "", category = "", status = "" } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const skip = (pageNum - 1) * limitNum;
 
-        const matchStage = {};
+    // ─── 2. Build $match stage ──────────────────────────────────────
+    const matchStage = {};
 
-        if (search.trim()) {
-            matchStage.name = {
-                $regex: new RegExp(search.trim(), "i"),
-            };
+    // Search sa name (case-insensitive, escaped regex)
+    if (search.trim()) {
+        const escaped = search
+            .trim()
+            .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        matchStage.name = { $regex: escaped, $options: "i" };
+    }
+
+    // ─── CATEGORY FILTER ────────────────────────────────────────────
+    // Support both single category at multiple categories (comma-separated)
+    if (category && category.trim()) {
+        const categoryList = category
+            .split(",")
+            .map((c) => c.trim())
+            .filter(Boolean);
+
+        if (categoryList.length === 1) {
+            matchStage.category = categoryList[0];
+        } else if (categoryList.length > 1) {
+            matchStage.category = { $in: categoryList };
         }
+    }
 
-        if (category.trim()) {
-            matchStage.category = category;
-        }
+    // Status filter
+    if (status && status.trim()) matchStage.status = status.trim();
 
-        if (status.trim()) {
-            matchStage.status = status;
-        }
+    // ─── 3. Build $sort stage ───────────────────────────────────────
+    const allowedSortFields = [
+        "createdAt",
+        "updatedAt",
+        "name",
+        "price",
+    ];
+    const sortField = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
+    const sortDir = sortOrder === "asc" ? 1 : -1;
 
-        const pipeline = [
+    // ─── 4. Execute data + count + categories in parallel ──────────
+    const [results, categories] = await Promise.all([
+        Food.aggregate([
             { $match: matchStage },
-            { $sort: { createdAt: -1 } },
+            { $sort: { [sortField]: sortDir } },
             {
                 $facet: {
-                    data: [{ $skip: skip }, { $limit: limit }],
+                    data: [
+                        { $skip: skip },
+                        { $limit: limitNum },
+                    ],
                     totalCount: [{ $count: "count" }],
                 },
             },
-        ];
+        ]),
+        // Kunin ang unique categories (para sa filter dropdown)
+        Food.distinct("category"),
+    ]);
 
-        const results = await Food.aggregate(pipeline);
-        const data = results[0].data;
-        const totalFood = results[0].totalCount[0]?.count || 0;
+    const data = results[0]?.data || [];
+    const totalFood = results[0]?.totalCount[0]?.count || 0;
 
-        // ============================================
-        // KUNIN ANG LAHAT NG UNIQUE CATEGORIES
-        // ============================================
-        const categories = await Food.distinct("category");
+    // ─── 5. Response ────────────────────────────────────────────────
+    res.status(200).json({
+        status: "success",
+        data,
+        totalFood,
+        totalRecords: totalFood,
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalFood / limitNum),
+        limit: limitNum,
+        count: data.length,
+        categories, // ← listahan ng categories para sa dropdown
 
-        res.status(200).json({
-            status: "success",
-            data,
-            totalFood,
-            currentPage: page,
-            totalPages: Math.ceil(totalFood / limit),
-            categories, // ← Isama ang list ng categories sa response
-        });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({
-            status: "fail",
-            message: "Something went wrong while fetching foods.",
-            error: error.message,
-        });
-    }
+        // Optional: ipakita ang active filter para sa frontend
+        appliedFilters: {
+            search: search.trim() || null,
+            category: category?.trim() || null,
+            status: status?.trim() || null,
+        },
+    });
 });
-
 // ======================
 // UPDATE FOOD (WITH DELETE OLD IMAGE)
 // ======================

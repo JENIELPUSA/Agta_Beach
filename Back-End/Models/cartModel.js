@@ -26,25 +26,39 @@ const CartSchema = new mongoose.Schema({
 });
 
 // ======================
-// AUTO DELETE IF ITEMS EMPTY
+// PRE-SAVE HOOK
+// ✅ HUWAG i-delete ang cart kahit empty
 // ======================
-CartSchema.pre("save", async function (next) {
-  try {
-    // Check if items array is empty
-    if (this.items.length === 0) {
-      // If document already exists in DB, delete it
-      if (!this.isNew) {
-        await this.constructor.findByIdAndDelete(this._id);
-      }
-
-      // Stop saving
-      return next(new Error("Cart deleted because it has no items."));
-    }
-
-    next();
-  } catch (error) {
-    next(error);
+CartSchema.pre("save", function (next) {
+  // ✅ Walang auto-delete — hayaan lang na empty ang items
+  // Ito ay para hindi mag-error sa GET /cartFood/:userId
+  if (this.items.length === 0) {
+    console.log(`ℹ️ [Cart] Cart ${this._id} is now empty (kept in DB)`);
   }
+  next();
 });
+
+// ======================
+// OPTIONAL: Static method para sa clear
+// ======================
+CartSchema.statics.clearCartForUser = async function (userId) {
+  const cart = await this.findOne({ customerId: userId });
+  if (cart) {
+    cart.items = [];
+    await cart.save();
+  }
+  return cart;
+};
+
+// ======================
+// OPTIONAL: Static method para sa get or create
+// ======================
+CartSchema.statics.getOrCreateCart = async function (userId) {
+  let cart = await this.findOne({ customerId: userId });
+  if (!cart) {
+    cart = await this.create({ customerId: userId, items: [] });
+  }
+  return cart;
+};
 
 module.exports = mongoose.model("CartFood", CartSchema);

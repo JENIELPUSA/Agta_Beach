@@ -2,13 +2,111 @@ const BillingHistory = require("../Models/BillingHistorySchema");
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 const Notification = require("../Models/NotificationSchema");
 const UserLoginSchema = require("../Models/LogInDentalSchema");
+const Customer = require("../Models/CustomerSchema"); //  IDAGDAG ITO
 const mongoose = require("mongoose");
-const actionbooking = require("../Models/ActionBooking")
-const orders = require("../Models/OrderSchema")
+const actionbooking = require("../Models/ActionBooking");
+const orders = require("../Models/OrderSchema");
+const Accommodation = require("../Models/ActionBooking");
+const sendEmail = require("../Utils/email");
 
 const axios = require("axios");
 const fs = require("fs");
 const FormData = require("form-data");
+
+// ====================  HELPER: Build Order Origin ====================
+const buildOrderOrigin = async (actionBooking, customerId = null) => {
+  try {
+    if (!actionBooking) return null;
+
+    const origin = {
+      accommodationId: null,
+      accommodationName: null,
+      accommodationType: null,
+      roomNumber: null,
+      avatar: { url: null, public_id: null },
+      actionBookingId: actionBooking._id || null,
+      bookingNumber: actionBooking.bookingNumber || null,
+      customerId: customerId || actionBooking.customerId || null,
+    };
+
+    if (actionBooking.bookingItemModel === 'Accommodation') {
+      return null;
+    }
+
+    if (actionBooking.origin && actionBooking.origin.accommodationId) {
+      return {
+        ...origin,
+        accommodationId: actionBooking.origin.accommodationId,
+        accommodationName: actionBooking.origin.accommodationName || null,
+        accommodationType: actionBooking.origin.accommodationType || null,
+        roomNumber: actionBooking.origin.roomNumber || null,
+        avatar: actionBooking.origin.avatar || { url: null, public_id: null },
+        actionBookingId: actionBooking.origin.actionBookingId || actionBooking._id,
+        bookingNumber: actionBooking.origin.bookingNumber || actionBooking.bookingNumber,
+      };
+    }
+
+    if (actionBooking.relatedAccommodationId) {
+      const accommodation = await Accommodation.findById(
+        actionBooking.relatedAccommodationId
+      ).lean();
+
+      if (accommodation) {
+        return {
+          ...origin,
+          accommodationId: accommodation._id,
+          accommodationName: accommodation.name || null,
+          accommodationType: accommodation.type || null,
+          roomNumber: accommodation.roomNumber || null,
+          avatar: {
+            url: accommodation.avatar?.url || null,
+            public_id: accommodation.avatar?.public_id || null,
+          },
+        };
+      }
+    }
+
+    const searchCustomerId = customerId || actionBooking.customerId;
+    if (searchCustomerId) {
+      const activeAccommodationBooking = await actionbooking.findOne({
+        customerId: searchCustomerId,
+        bookingItemModel: 'Accommodation',
+        status: { $in: ['Confirmed', 'Paid', 'waiting'] },
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      if (activeAccommodationBooking) {
+        const accommodation = await Accommodation.findById(
+          activeAccommodationBooking.bookingItemId
+        ).lean();
+
+        if (accommodation) {
+          return {
+            ...origin,
+            accommodationId: accommodation._id,
+            accommodationName: accommodation.name || null,
+            accommodationType: accommodation.type || null,
+            roomNumber: accommodation.roomNumber || null,
+            avatar: {
+              url: accommodation.avatar?.url || null,
+              public_id: accommodation.avatar?.public_id || null,
+            },
+            actionBookingId: activeAccommodationBooking._id,
+            bookingNumber: activeAccommodationBooking.bookingNumber,
+          };
+        }
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('❌ [buildOrderOrigin] Error:', error);
+    return null;
+  }
+};
+
+// ==================== CREATE ====================
 
 exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
   console.log("BODY________", req.body);
@@ -20,7 +118,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     let processedBy = req.body.processedBy;
     let metadata = req.body.metadata;
 
-    // Parse JSON strings if they are strings
     if (typeof paymentDetails === 'string') {
       paymentDetails = JSON.parse(paymentDetails);
     }
@@ -39,95 +136,146 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     console.log("📋 Processed By:", processedBy);
     console.log("📋 Metadata:", metadata);
 
+    //  I-extract ang selectedAccommodation details
+    const selectedAccommodation = paymentDetails?.selectedAccommodation || null;
+    const selectedAccommodationDetails = paymentDetails?.selectedAccommodationDetails || null;
+
+    console.log("🏠 Selected Accommodation:", selectedAccommodation);
+    console.log("🏠 Selected Accommodation Details:", JSON.stringify(selectedAccommodationDetails, null, 2));
+
     // ============================================
-    // EXTRACT AND VALIDATE CUSTOMER ID
+    // EXTRACT CUSTOMER ID
     // ============================================
+    let rawCustomerId = null;
     let customerId = null;
     let bookingIds = [];
 
     if (bookings && bookings.length > 0) {
       const firstBooking = bookings[0];
 
-      // Try to get customerId from various possible fields
       if (firstBooking.customerId) {
-        customerId = firstBooking.customerId;
+        rawCustomerId = firstBooking.customerId;
       } else if (firstBooking.customer && firstBooking.customer._id) {
-        customerId = firstBooking.customer._id;
+        rawCustomerId = firstBooking.customer._id;
       } else if (firstBooking.customer && firstBooking.customer.id) {
-        customerId = firstBooking.customer.id;
+        rawCustomerId = firstBooking.customer.id;
       } else if (firstBooking.userId) {
-        customerId = firstBooking.userId;
+        rawCustomerId = firstBooking.userId;
       } else if (firstBooking.customer && firstBooking.customer.customerId) {
-        customerId = firstBooking.customer.customerId;
+        rawCustomerId = firstBooking.customer.customerId;
       }
 
-      // Extract booking IDs
       bookingIds = bookings.map(b => b._id).filter(id => id);
       console.log(`📋 Extracted ${bookingIds.length} booking IDs:`, bookingIds);
-      console.log(`👤 Extracted customerId from booking: ${customerId}`);
+      console.log(`👤 Raw customerId from booking: ${rawCustomerId}`);
     }
 
-    if (!customerId && req.user) {
-      customerId = req.user._id || req.user.id;
-      console.log(`👤 Using customerId from request user: ${customerId}`);
+    if (!rawCustomerId && req.user) {
+      rawCustomerId = req.user._id || req.user.id;
+      console.log(`👤 Raw customerId from request user: ${rawCustomerId}`);
+    }
+
+    if (!rawCustomerId) {
+      console.warn("⚠️ No raw customerId found in bookings or request");
+    }
+
+    // ============================================
+    //  CONVERT rawCustomerId → Customer._id
+    // ============================================
+    let userLoginDoc = null;
+    let customerDoc = null;
+    customerId = rawCustomerId;
+
+    if (rawCustomerId && mongoose.Types.ObjectId.isValid(rawCustomerId)) {
+      try {
+        console.log(`🔍 Looking up for ID: ${rawCustomerId}`);
+
+        userLoginDoc = await UserLoginSchema.findOne({
+          $or: [
+            { _id: rawCustomerId },
+            { linkedId: rawCustomerId },
+          ],
+        }).lean();
+
+        if (userLoginDoc) {
+          console.log(` Found UserLoginSchema: ${userLoginDoc._id}`);
+          console.log(`👤 User role: ${userLoginDoc.role}`);
+          console.log(`🔗 linkedId: ${userLoginDoc.linkedId}`);
+
+          if (userLoginDoc.linkedId) {
+            customerId = userLoginDoc.linkedId;
+            console.log(` Using linkedId (Customer._id): ${customerId}`);
+
+            customerDoc = await Customer.findById(customerId).lean();
+            if (customerDoc) {
+              console.log(` Customer found: ${customerDoc.first_name} ${customerDoc.last_name}`);
+            } else {
+              console.warn(`⚠️ Customer not found for linkedId: ${customerId}`);
+            }
+          } else {
+            customerId = userLoginDoc._id;
+            console.log(`⚠️ No linkedId, using UserLoginSchema._id: ${customerId}`);
+          }
+        } else {
+          console.log(`⚠️ UserLoginSchema not found, checking Customer...`);
+          customerDoc = await Customer.findById(rawCustomerId).lean();
+
+          if (customerDoc) {
+            customerId = customerDoc._id;
+            console.log(` Found Customer directly: ${customerDoc.first_name} ${customerDoc.last_name}`);
+          } else {
+            console.warn(`⚠️ Customer not found either for ID: ${rawCustomerId}`);
+            customerId = rawCustomerId;
+          }
+        }
+      } catch (lookupError) {
+        console.error("❌ Error looking up customer:", lookupError.message);
+        customerId = rawCustomerId;
+      }
+    } else {
+      console.warn(`⚠️ rawCustomerId is not a valid ObjectId: ${rawCustomerId}`);
     }
 
     if (!customerId) {
-      console.warn("⚠️ No customerId found in bookings or request");
+      console.warn("⚠️ No customerId found");
       customerId = "unknown-customer";
     }
+
+    console.log(`📌 FINAL customerId (Customer._id): ${customerId}`);
+    console.log(`📌 FINAL customerId type: ${typeof customerId}`);
 
     // ============================================
     // 🔍 SEARCH FOR ROOM NUMBER FROM ACTIONBOOKING
     // ============================================
     let roomNumber = "";
-    let customerDetails = null;
+    let customerDetails = customerDoc;
     let actionBookingData = null;
 
     try {
-      // If we have booking IDs, search in ActionBooking
       if (bookingIds && bookingIds.length > 0) {
         console.log(`🔍 Searching for booking details in ActionBooking...`);
-        
-        // Find the first booking in ActionBooking
+
         const firstBookingId = bookingIds[0];
-        
+
         if (mongoose.Types.ObjectId.isValid(firstBookingId)) {
           actionBookingData = await actionbooking.findById(firstBookingId)
-            .populate('customerId') // Populate customer details
+            .populate('customerId')
             .lean();
-          
+
           if (actionBookingData) {
-            console.log(`✅ Found ActionBooking: ${actionBookingData._id}`);
-            console.log(`📋 ActionBooking Data:`, JSON.stringify(actionBookingData, null, 2));
+            console.log(` Found ActionBooking: ${actionBookingData._id}`);
             console.log(`📋 Booking Item Model: ${actionBookingData.bookingItemModel}`);
-            
-            // ============================================
-            // 🔍 CHECK IF BOOKING ITEM MODEL IS ACCOMMODATION
-            // ============================================
+
             if (actionBookingData.bookingItemModel === 'Accommodation') {
-              console.log(`✅ This is an Accommodation booking`);
-              
-              // ============================================
-              // 🔍 GET ROOM NUMBER FROM ACTIONBOOKING
-              // ============================================
-              // Check if ActionBooking has roomNumber field directly
+              console.log(` This is an Accommodation booking`);
+
               if (actionBookingData.roomNumber) {
                 roomNumber = actionBookingData.roomNumber;
-                console.log(`🏠 Room number from ActionBooking.roomNumber: ${roomNumber}`);
-              } 
-              // Check if roomNumber is in delivery object
-              else if (actionBookingData.delivery && actionBookingData.delivery.roomNumber) {
+              } else if (actionBookingData.delivery && actionBookingData.delivery.roomNumber) {
                 roomNumber = actionBookingData.delivery.roomNumber;
-                console.log(`🏠 Room number from ActionBooking.delivery.roomNumber: ${roomNumber}`);
-              }
-              // Check if roomNumber is in address object
-              else if (actionBookingData.address && actionBookingData.address.roomNumber) {
+              } else if (actionBookingData.address && actionBookingData.address.roomNumber) {
                 roomNumber = actionBookingData.address.roomNumber;
-                console.log(`🏠 Room number from ActionBooking.address.roomNumber: ${roomNumber}`);
-              }
-              // Check if there's a room field
-              else if (actionBookingData.room) {
+              } else if (actionBookingData.room) {
                 if (typeof actionBookingData.room === 'string') {
                   roomNumber = actionBookingData.room;
                 } else if (typeof actionBookingData.room === 'object' && actionBookingData.room.number) {
@@ -135,80 +283,55 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
                 } else if (typeof actionBookingData.room === 'object' && actionBookingData.room.roomNumber) {
                   roomNumber = actionBookingData.room.roomNumber;
                 }
-                console.log(`🏠 Room number from ActionBooking.room: ${roomNumber}`);
-              }
-              // Check if roomNumber is in location object
-              else if (actionBookingData.location && actionBookingData.location.roomNumber) {
+              } else if (actionBookingData.location && actionBookingData.location.roomNumber) {
                 roomNumber = actionBookingData.location.roomNumber;
-                console.log(`🏠 Room number from ActionBooking.location.roomNumber: ${roomNumber}`);
               }
-              
-              // If still no room number, try to extract from bookingItemId
+
               if (!roomNumber && actionBookingData.bookingItemId) {
-                console.log(`🔍 Trying to get room from bookingItemId: ${actionBookingData.bookingItemId}`);
-                // If bookingItemId is an object with room info
                 if (typeof actionBookingData.bookingItemId === 'object') {
                   if (actionBookingData.bookingItemId.roomNumber) {
                     roomNumber = actionBookingData.bookingItemId.roomNumber;
-                    console.log(`🏠 Room number from bookingItemId.roomNumber: ${roomNumber}`);
                   } else if (actionBookingData.bookingItemId.room && actionBookingData.bookingItemId.room.number) {
                     roomNumber = actionBookingData.bookingItemId.room.number;
-                    console.log(`🏠 Room number from bookingItemId.room.number: ${roomNumber}`);
                   }
                 }
               }
-              
-              console.log(`✅ Final room number from ActionBooking: ${roomNumber || 'Not found'}`);
+
+              console.log(` Final room number: ${roomNumber || 'Not found'}`);
             } else {
-              console.log(`ℹ️ Booking item model is ${actionBookingData.bookingItemModel}, not Accommodation`);
-            }
-            
-            // If still no room number, try to get from customer
-            if (!roomNumber && actionBookingData.customerId) {
-              if (typeof actionBookingData.customerId === 'object' && actionBookingData.customerId._id) {
-                customerDetails = actionBookingData.customerId;
-              } else if (actionBookingData.customerId.toString) {
-                const customerIdFromBooking = actionBookingData.customerId.toString ? 
-                  actionBookingData.customerId.toString() : actionBookingData.customerId;
-                
-                if (mongoose.Types.ObjectId.isValid(customerIdFromBooking)) {
-                  customerDetails = await UserLoginSchema.findById(customerIdFromBooking).lean();
-                  if (customerDetails) {
-                    console.log(`✅ Customer found via UserLogin: ${customerDetails.name || customerDetails.email}`);
-                    
-                    // Get room number from customer details if not found in ActionBooking
-                    if (!roomNumber) {
-                      if (customerDetails.roomNumber) {
-                        roomNumber = customerDetails.roomNumber;
-                      } else if (customerDetails.delivery && customerDetails.delivery.roomNumber) {
-                        roomNumber = customerDetails.delivery.roomNumber;
-                      } else if (customerDetails.address && customerDetails.address.roomNumber) {
-                        roomNumber = customerDetails.address.roomNumber;
-                      }
-                      console.log(`🏠 Room number from UserLogin: ${roomNumber || 'Not found'}`);
-                    }
+              console.log(`ℹ️ Non-Accommodation booking`);
+
+              const customerIdForSearch = actionBookingData.customerId?._id || actionBookingData.customerId;
+              if (customerIdForSearch) {
+                const relatedAccommodationBooking = await actionbooking.findOne({
+                  customerId: customerIdForSearch,
+                  bookingItemModel: 'Accommodation',
+                  status: { $in: ['Confirmed', 'Paid', 'waiting'] },
+                })
+                  .sort({ createdAt: -1 })
+                  .lean();
+
+                if (relatedAccommodationBooking) {
+                  if (relatedAccommodationBooking.roomNumber) {
+                    roomNumber = relatedAccommodationBooking.roomNumber;
+                  } else if (relatedAccommodationBooking.delivery?.roomNumber) {
+                    roomNumber = relatedAccommodationBooking.delivery.roomNumber;
                   }
+                  console.log(`🏠 Room from related Accommodation: ${roomNumber || 'Not found'}`);
                 }
               }
             }
-          } else {
-            console.warn(`⚠️ ActionBooking not found with ID: ${firstBookingId}`);
           }
         }
       }
-      
-      // If no room number found, try searching by customerId directly
+
       if (!roomNumber && customerId && customerId !== "unknown-customer") {
-        console.log(`🔍 Searching for customer with ID: ${customerId}`);
-        
         if (mongoose.Types.ObjectId.isValid(customerId)) {
           if (!customerDetails) {
-            customerDetails = await UserLoginSchema.findById(customerId).lean();
+            customerDetails = await Customer.findById(customerId).lean();
           }
-          
+
           if (customerDetails) {
-            console.log(`✅ Customer found: ${customerDetails.name || customerDetails.email}`);
-            
             if (customerDetails.roomNumber) {
               roomNumber = customerDetails.roomNumber;
             } else if (customerDetails.delivery && customerDetails.delivery.roomNumber) {
@@ -216,69 +339,82 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
             } else if (customerDetails.address && customerDetails.address.roomNumber) {
               roomNumber = customerDetails.address.roomNumber;
             }
-            
             console.log(`🏠 Customer Room Number: ${roomNumber || 'Not found'}`);
           }
         }
       }
-      
-      // Last resort: Search all ActionBookings with the same customer
+
       if (!roomNumber && customerId && customerId !== "unknown-customer") {
-        console.log(`🔍 Searching all ActionBookings for customer: ${customerId}`);
-        
-        const customerBookings = await actionbooking.find({ 
+        const customerBookings = await actionbooking.find({
           customerId: customerId,
-          bookingItemModel: 'Accommodation' // Only search Accommodation bookings
+          bookingItemModel: 'Accommodation'
         }).lean();
-        
+
         if (customerBookings && customerBookings.length > 0) {
-          console.log(`📋 Found ${customerBookings.length} Accommodation bookings for this customer`);
-          
           for (const booking of customerBookings) {
-            // Try to extract room number from each booking
             if (booking.roomNumber) {
               roomNumber = booking.roomNumber;
-              console.log(`🏠 Found room number in booking: ${roomNumber}`);
               break;
             } else if (booking.delivery && booking.delivery.roomNumber) {
               roomNumber = booking.delivery.roomNumber;
-              console.log(`🏠 Found room number in booking.delivery: ${roomNumber}`);
               break;
             } else if (booking.room && booking.room.number) {
               roomNumber = booking.room.number;
-              console.log(`🏠 Found room number in booking.room.number: ${roomNumber}`);
-              break;
-            } else if (booking.address && booking.address.roomNumber) {
-              roomNumber = booking.address.roomNumber;
-              console.log(`🏠 Found room number in booking.address: ${roomNumber}`);
               break;
             }
           }
         }
       }
 
-      console.log(`✅ Final Room Number: ${roomNumber || 'Not found'}`);
+      console.log(` Final Room Number: ${roomNumber || 'Not found'}`);
 
     } catch (error) {
       console.error("❌ Error finding customer/booking:", error.message);
-      console.error("Error stack:", error.stack);
     }
 
     // ============================================
-    // ADD ROOM NUMBER TO BOOKINGS
+    //  BUILD ORDER ORIGIN
     // ============================================
-    if (bookings && bookings.length > 0 && roomNumber) {
-      bookings = bookings.map(booking => ({
-        ...booking,
-        roomNumber: roomNumber,
-        delivery: {
-          ...booking.delivery,
-          roomNumber: roomNumber
+    let orderOrigin = null;
+    try {
+      if (actionBookingData) {
+        console.log(`🎯 Building order origin from ActionBooking...`);
+        orderOrigin = await buildOrderOrigin(
+          actionBookingData,
+          customerId !== "unknown-customer" ? customerId : null
+        );
+        console.log(` Order Origin:`, JSON.stringify(orderOrigin, null, 2));
+      }
+    } catch (originError) {
+      console.error(`⚠️ Error building order origin:`, originError.message);
+    }
+
+    // ============================================
+    // ADD ROOM NUMBER + ORIGIN TO BOOKINGS
+    // ============================================
+    if (bookings && bookings.length > 0) {
+      bookings = bookings.map(booking => {
+        const updatedBooking = { ...booking };
+
+        if (roomNumber) {
+          updatedBooking.roomNumber = roomNumber;
+          updatedBooking.delivery = {
+            ...booking.delivery,
+            roomNumber: roomNumber
+          };
         }
-      }));
-      console.log(`✅ Added roomNumber "${roomNumber}" to all bookings`);
-    } else if (bookings && bookings.length > 0) {
-      console.warn(`⚠️ No roomNumber found, keeping existing delivery info`);
+
+        if (orderOrigin && booking.bookingItemModel !== 'Accommodation') {
+          updatedBooking.origin = orderOrigin;
+        }
+
+        updatedBooking.customerId = customerId;
+
+        return updatedBooking;
+      });
+
+      console.log(` Added roomNumber "${roomNumber}" and origin to all bookings`);
+      console.log(` Set customerId "${customerId}" on all bookings`);
     }
 
     // ============================================
@@ -288,12 +424,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
 
     if (req.file) {
       console.log("📸 Uploading image to UPLOADAGTA...");
-      console.log("📁 File:", {
-        originalname: req.file.originalname,
-        size: `${(req.file.size / 1024).toFixed(2)} KB`,
-        mimetype: req.file.mimetype,
-        path: req.file.path,
-      });
 
       const form = new FormData();
       form.append("file", fs.createReadStream(req.file.path), req.file.originalname);
@@ -304,28 +434,22 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
           headers: { ...form.getHeaders() },
         });
 
-        console.log("📤 Upload Response:", response.data);
-
         if (response.data && response.data.url) {
           avatar = {
             url: response.data.url,
             public_id: response.data.public_id || response.data.filename || req.file.filename,
           };
-          console.log("✅ Image uploaded successfully:", avatar);
         } else if (response.data && response.data.success && response.data.data) {
           avatar = {
             url: response.data.data.url,
             public_id: response.data.data.public_id || req.file.filename,
           };
-          console.log("✅ Image uploaded successfully:", avatar);
         } else if (response.data && response.data.file) {
           avatar = {
             url: response.data.file,
             public_id: req.file.filename,
           };
-          console.log("✅ Image uploaded successfully:", avatar);
         } else {
-          console.log("⚠️ Unexpected response format:", response.data);
           avatar = {
             url: `/temp-uploads/${req.file.filename}`,
             public_id: req.file.filename,
@@ -334,17 +458,13 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
 
         if (fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
-          console.log("🗑️ Temporary file deleted:", req.file.path);
         }
       } catch (err) {
         console.error("❌ Upload Error:", err.message);
         if (fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
-          console.log("🗑️ Temporary file deleted (error):", req.file.path);
         }
       }
-    } else {
-      console.log("ℹ️ No image file provided, using default avatar.");
     }
 
     // Validate required fields
@@ -355,7 +475,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Validate payment type
     if (!paymentDetails.paymentType) {
       return res.status(400).json({
         success: false,
@@ -363,7 +482,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Validate partial payment amount
     if (paymentDetails.paymentType === "partial") {
       if (!paymentDetails.paymentAmount || paymentDetails.paymentAmount <= 0) {
         return res.status(400).json({
@@ -379,7 +497,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       }
     }
 
-    // Calculate remaining balance
     const remainingBalance = paymentDetails.paymentType === "partial"
       ? paymentDetails.totalAmount - paymentDetails.paymentAmount
       : 0;
@@ -388,13 +505,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     const paymentStatus = isFullyPaid ? "completed" : "pending";
     const billingStatus = isFullyPaid ? "fully_paid" : "partial";
 
-    console.log(`💰 Payment Type: ${paymentDetails.paymentType}`);
-    console.log(`💰 Remaining Balance: ₱${remainingBalance.toFixed(2)}`);
-    console.log(`💰 Is Fully Paid: ${isFullyPaid}`);
-    console.log(`💰 Payment Status: ${paymentStatus}`);
-    console.log(`💰 Billing Status: ${billingStatus}`);
-
-    // Check for existing billing with the same reference number
     let referenceNumber = null;
     if (bookings && bookings.length > 0) {
       referenceNumber = bookings[0].bookingNumber || bookings[0].orderNumber || bookings[0].referenceNo;
@@ -428,12 +538,12 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         );
 
         console.log(`📋 Found existing billing with reference: ${referenceNumber}`);
-        console.log(`Current status: ${existingBilling.status}`);
-        console.log(`Current remaining balance: ${existingBooking?.remainingBalance || 0}`);
       }
     }
 
-    // If existing billing found and it's a partial payment, update it
+    // ============================================
+    // UPDATE EXISTING PARTIAL PAYMENT
+    // ============================================
     if (existingBilling && existingBooking && existingBilling.status === "partial") {
       console.log(`🔄 Updating existing partial payment for reference: ${referenceNumber}`);
 
@@ -443,12 +553,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       const isNowFullyPaid = updatedRemainingBalance <= 0;
       const totalPaidSoFar = (existingBooking.amount || 0) - updatedRemainingBalance;
 
-      console.log(`Current remaining: ₱${currentRemainingBalance.toFixed(2)}`);
-      console.log(`New payment: ₱${newPaymentAmount.toFixed(2)}`);
-      console.log(`New remaining: ₱${updatedRemainingBalance.toFixed(2)}`);
-      console.log(`Total paid: ₱${totalPaidSoFar.toFixed(2)}`);
-      console.log(`Fully paid: ${isNowFullyPaid}`);
-
       const updatedBookings = existingBilling.bookings.map(booking => {
         const isMatchingBooking =
           booking.referenceNo === referenceNumber ||
@@ -456,16 +560,19 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
           booking.orderNumber === referenceNumber;
 
         if (isMatchingBooking) {
+          const bookingData = booking.toObject ? booking.toObject() : booking;
           return {
-            ...booking.toObject ? booking.toObject() : booking,
+            ...bookingData,
             remainingBalance: updatedRemainingBalance,
             paymentAmount: totalPaidSoFar,
             paymentStatus: isNowFullyPaid ? "full" : "partial",
             roomNumber: roomNumber || booking.roomNumber,
+            customerId: customerId || booking.customerId,
             delivery: {
               ...booking.delivery,
               roomNumber: roomNumber || booking.delivery?.roomNumber
-            }
+            },
+            origin: orderOrigin || booking.origin || null,
           };
         }
         return booking;
@@ -487,6 +594,15 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
             "paymentDetails.processedAt": new Date(),
             "status": newBillingStatus,
             "bookings": updatedBookings,
+            "customerId": customerId || existingBilling.customerId,
+
+            ...(selectedAccommodation && {
+              "paymentDetails.selectedAccommodation": selectedAccommodation,
+            }),
+            ...(selectedAccommodationDetails && {
+              "paymentDetails.selectedAccommodationDetails": selectedAccommodationDetails,
+            }),
+
             ...(avatar.url && { avatar: avatar })
           },
           $push: {
@@ -494,7 +610,7 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
               status: newBillingStatus,
               timestamp: new Date(),
               note: isNowFullyPaid
-                ? `✅ Fully Paid! Remaining balance: ₱0.00. Total paid: ₱${totalPaidSoFar.toFixed(2)}`
+                ? ` Fully Paid! Remaining balance: ₱0.00. Total paid: ₱${totalPaidSoFar.toFixed(2)}`
                 : `💰 Additional partial payment of ₱${newPaymentAmount.toFixed(2)}. Remaining balance: ₱${updatedRemainingBalance.toFixed(2)}. Total paid: ₱${totalPaidSoFar.toFixed(2)}`,
               updatedBy: {
                 userId: processedBy?.userId || req.user?._id || "system",
@@ -506,24 +622,21 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         { new: true }
       );
 
-      console.log(`✅ Updated billing: ${updatedBilling.transactionId}`);
-      console.log(`New remaining balance: ₱${updatedRemainingBalance.toFixed(2)}`);
-      console.log(`Status: ${isNowFullyPaid ? "FULLY PAID" : "PARTIAL"}`);
+      console.log(` Updated billing: ${updatedBilling.transactionId}`);
+      console.log(`👤 Customer ID: ${updatedBilling.customerId}`);
 
-      // Socket emit and notification...
       const io = req.app.get("socketio");
 
       if (io) {
         const payload = {
           billingHistory: updatedBilling,
           message: isNowFullyPaid
-            ? `✅ Billing ${updatedBilling.transactionId} is now fully paid!`
+            ? ` Billing ${updatedBilling.transactionId} is now fully paid!`
             : `💰 Additional payment for ${updatedBilling.transactionId} - Remaining: ₱${updatedRemainingBalance.toFixed(2)}`
         };
 
         io.to("admin").emit("updateBilling", payload);
         io.to("finance").emit("updateBilling", payload);
-        console.log(`📡 BILLING UPDATE EMITTED TO ADMIN + FINANCE`);
       }
 
       const staffMembers = await UserLoginSchema.find({
@@ -537,7 +650,7 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
 
       const newNotification = await Notification.create({
         message: isNowFullyPaid
-          ? `✅ ${updatedBilling.transactionId} is now fully paid! (Total: ₱${totalPaidSoFar.toFixed(2)})`
+          ? ` ${updatedBilling.transactionId} is now fully paid! (Total: ₱${totalPaidSoFar.toFixed(2)})`
           : `💰 Additional payment for ${updatedBilling.transactionId} - ₱${newPaymentAmount.toFixed(2)}. Remaining: ₱${updatedRemainingBalance.toFixed(2)}`,
         FileId: updatedBilling._id,
         viewers: viewersList,
@@ -554,7 +667,41 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
 
         io.to("admin").emit("newNotification", notifPayload);
         io.to("finance").emit("newNotification", notifPayload);
-        console.log("🔔 NOTIFICATION EMITTED TO ADMIN + FINANCE");
+      }
+
+      // ==================== SEND EMAIL — FULLY PAID OR PARTIAL (UPDATE PATH) ====================
+      try {
+        const customerIdForEmail = updatedBilling.customerId;
+
+        if (customerIdForEmail) {
+          const userLogin = await UserLoginSchema.findOne({
+            linkedId: customerIdForEmail
+          }).select("username linkedId");
+
+          if (userLogin && userLogin.username) {
+            const emailSubject = isNowFullyPaid
+              ? "Payment Completed - Fully Paid"
+              : "Payment Received - Partially Paid";
+
+            const emailText = isNowFullyPaid
+              ? `Your billing ${updatedBilling.transactionId} is now FULLY PAID. Total paid: ₱${totalPaidSoFar.toFixed(2)}. Remaining balance: ₱0.00. Thank you!`
+              : `We received your partial payment for billing ${updatedBilling.transactionId}.\n\nAmount paid: ₱${newPaymentAmount.toFixed(2)}\nTotal paid so far: ₱${totalPaidSoFar.toFixed(2)}\nRemaining balance: ₱${updatedRemainingBalance.toFixed(2)}\n\nThank you!`;
+
+            await sendEmail({
+              email: userLogin.username,
+              subject: emailSubject,
+              text: emailText,
+            });
+
+            console.log(`📧 Email sent to ${userLogin.username} (${isNowFullyPaid ? "FULLY PAID" : "PARTIAL"}) for billing ${updatedBilling.transactionId}`);
+          } else {
+            console.warn(`⚠️ No user login found for linkedId: ${customerIdForEmail}`);
+          }
+        } else {
+          console.warn("⚠️ No customerId found for email notification");
+        }
+      } catch (emailError) {
+        console.error("⚠️ Error sending email:", emailError.message);
       }
 
       return res.status(200).json({
@@ -565,15 +712,14 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // If no existing billing found, create a new one
+    // ============================================
+    // CREATE NEW BILLING RECORD
+    // ============================================
     console.log(`🆕 Creating new billing record`);
 
     const transactionId = BillingHistory.getTransactionId();
     console.log(`📋 Generated Transaction ID: ${transactionId}`);
 
-    // ============================================
-    // UPDATE BOOKINGS WITH CUSTOMER ID AND PAYMENT INFO
-    // ============================================
     const updatedBookings = bookings.map(booking => {
       let bookingPaymentAmount = booking.amount;
       let bookingRemainingBalance = 0;
@@ -583,7 +729,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         bookingRemainingBalance = booking.amount - bookingPaymentAmount;
       }
 
-      // Get roomNumber from customer or existing booking
       const bookingRoomNumber = roomNumber || booking.roomNumber || booking.delivery?.roomNumber || '';
 
       return {
@@ -597,11 +742,11 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         delivery: {
           ...booking.delivery,
           roomNumber: bookingRoomNumber
-        }
+        },
+        origin: booking.origin || (booking.bookingItemModel !== 'Accommodation' ? orderOrigin : null) || null,
       };
     });
 
-    // Create new billing history
     const billingHistory = new BillingHistory({
       transactionId: transactionId,
       customerId: customerId,
@@ -611,7 +756,10 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         paymentType: paymentDetails.paymentType || "full",
         remainingBalance: remainingBalance,
         processedAt: paymentDetails.processedAt || new Date(),
-        status: paymentStatus
+        status: paymentStatus,
+
+        selectedAccommodation: selectedAccommodation,
+        selectedAccommodationDetails: selectedAccommodationDetails,
       },
       bookings: updatedBookings,
       processedBy: {
@@ -625,17 +773,13 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       status: billingStatus
     });
 
-    // Save - this will trigger pre-save hooks
     await billingHistory.save();
-    console.log("✅ Billing created successfully!");
-    console.log("📋 Transaction ID:", billingHistory.transactionId);
-    console.log("👤 Customer ID:", billingHistory.customerId);
-    console.log("🏠 Room Number:", roomNumber || 'Not set');
-    console.log("📸 Avatar saved:", billingHistory.avatar);
-    console.log("📊 Payment Status:", billingHistory.paymentDetails?.status);
-    console.log("📊 Billing Status:", billingHistory.status);
 
-    // Extract all IDs from bookings
+    console.log(" Billing created successfully!");
+    console.log("📋 Transaction ID:", billingHistory.transactionId);
+    console.log("👤 Customer ID (Customer._id):", billingHistory.customerId);
+    console.log("🏠 Room Number:", roomNumber || 'Not set');
+
     const bookingIdsToUpdate = billingHistory.bookings
       .map(booking => booking._id)
       .filter(id => id);
@@ -643,28 +787,14 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     console.log(`📋 Found ${bookingIdsToUpdate.length} booking/order IDs to process:`, bookingIdsToUpdate);
 
     // ============================================
-    // UPDATE ACTION BOOKINGS STATUS
+    // UPDATE ORDERS STATUS ONLY (NOT ACTION BOOKINGS)
     // ============================================
+    //  TINANGGAL NA ANG ACTION BOOKING UPDATE DITO
+    //  Ang ActionBooking status ay hindi na gagalawin sa CREATE.
+    //  Ang status update para sa ActionBooking ay ginagawa na lang ng
+    //  BillingHistory post-save hook (`updateActionBookingStatus`)
+    //  at ito ay may filter na para hindi mabago ang "Confirmed".
     if (bookingIdsToUpdate.length > 0) {
-      try {
-        const updatedActionBookings = await actionbooking.updateMany(
-          { _id: { $in: bookingIdsToUpdate } },
-          {
-            $set: {
-              status: "Paid",
-              isDone: true,
-              updatedAt: new Date()
-            }
-          }
-        );
-
-        if (updatedActionBookings.modifiedCount > 0) {
-          console.log(`✅ Updated ${updatedActionBookings.modifiedCount} action booking(s) status to "Paid"`);
-        }
-      } catch (updateError) {
-        console.error("⚠️ Error updating action bookings:", updateError);
-      }
-
       try {
         const updatedOrders = await orders.updateMany(
           { _id: { $in: bookingIdsToUpdate } },
@@ -682,7 +812,7 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         );
 
         if (updatedOrders.modifiedCount > 0) {
-          console.log(`✅ Updated ${updatedOrders.modifiedCount} order(s) status to "completed"`);
+          console.log(` Updated ${updatedOrders.modifiedCount} order(s) status to "completed"`);
         }
       } catch (updateError) {
         console.error("⚠️ Error updating orders:", updateError);
@@ -733,6 +863,43 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       console.log("🔔 NOTIFICATION EMITTED TO ADMIN + FINANCE");
     }
 
+    // ==================== SEND EMAIL — FULLY PAID OR PARTIAL (CREATE PATH) ====================
+    try {
+      const customerIdForEmail = billingHistory.customerId;
+
+      if (customerIdForEmail) {
+        const userLogin = await UserLoginSchema.findOne({
+          linkedId: customerIdForEmail
+        }).select("username linkedId");
+
+        if (userLogin && userLogin.username) {
+          const isFullyPaidNow = billingStatus === "fully_paid";
+
+          const emailSubject = isFullyPaidNow
+            ? "Payment Completed - Fully Paid"
+            : "Payment Received - Partially Paid";
+
+          const emailText = isFullyPaidNow
+            ? `Your billing ${billingHistory.transactionId} is FULLY PAID.\n\nTotal amount: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(2)}\nRemaining balance: ₱0.00\n\nThank you!`
+            : `We received your payment for billing ${billingHistory.transactionId}.\n\nAmount paid: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(2)}\nRemaining balance: ₱${billingHistory.paymentDetails.remainingBalance.toFixed(2)}\n\nThank you!`;
+
+          await sendEmail({
+            email: userLogin.username,
+            subject: emailSubject,
+            text: emailText,
+          });
+
+          console.log(`📧 Email sent to ${userLogin.username} (${isFullyPaidNow ? "FULLY PAID" : "PARTIAL"}) for billing ${billingHistory.transactionId}`);
+        } else {
+          console.warn(`⚠️ No user login found for linkedId: ${customerIdForEmail}`);
+        }
+      } else {
+        console.warn("⚠️ No customerId found for email notification");
+      }
+    } catch (emailError) {
+      console.error("⚠️ Error sending email:", emailError.message);
+    }
+
     res.status(201).json({
       success: true,
       message: "Billing history created successfully",
@@ -745,10 +912,12 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to create billing history",
+      message: "Failed to create billing history",
       error: error.message
     });
   }
 });
+
 // ==================== READ ====================
 
 exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
@@ -767,32 +936,24 @@ exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const pageSize = parseInt(limit);
 
-  // =========================
-  // 1. DYNAMIC FILTER OBJECT
-  // =========================
   let filter = {};
 
-  // STATUS FILTER
   if (status) {
     filter.status = status;
   }
 
-  // PAYMENT METHOD FILTER
   if (paymentMethod) {
     filter["paymentDetails.method"] = paymentMethod;
   }
 
-  // PAYMENT TYPE FILTER (NEW)
   if (paymentType) {
     filter["paymentDetails.paymentType"] = paymentType;
   }
 
-  // USER FILTER
   if (userId) {
     filter["processedBy.userId"] = userId;
   }
 
-  // DATE FILTER
   if (startDate || endDate) {
     filter["paymentDetails.processedAt"] = {};
     if (startDate) {
@@ -805,26 +966,39 @@ exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
     }
   }
 
-  // SEARCH FILTER
   if (search && search.trim() !== "") {
     filter.$or = [
       { transactionId: { $regex: search, $options: "i" } },
       { "paymentDetails.referenceNo": { $regex: search, $options: "i" } },
       { "bookings.orderNumber": { $regex: search, $options: "i" } },
-      { "bookings.bookingNumber": { $regex: search, $options: "i" } }
+      { "bookings.bookingNumber": { $regex: search, $options: "i" } },
+      { "paymentDetails.selectedAccommodation": { $regex: search, $options: "i" } }
     ];
   }
 
   console.log("🔍 GET BILLING HISTORY FILTER:", filter);
 
-  // =========================
-  // 2. AGGREGATION
-  // =========================
   const results = await BillingHistory.aggregate([
     { $match: filter },
     { $sort: { "paymentDetails.processedAt": -1 } },
 
-    // LOOKUP USER WHO PROCESSED
+    //  LOOKUP: Customer details from "customers"
+    {
+      $lookup: {
+        from: "customers",
+        localField: "customerId",
+        foreignField: "_id",
+        as: "customerDetails"
+      }
+    },
+    {
+      $unwind: {
+        path: "$customerDetails",
+        preserveNullAndEmptyArrays: true
+      }
+    },
+
+    //  LOOKUP: processedBy user
     {
       $lookup: {
         from: "userloginschemas",
@@ -840,20 +1014,32 @@ exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
       }
     },
 
-    // ADD COMPUTED FIELDS
     {
       $addFields: {
         processedByName: "$processedByUser.name",
         processedByEmail: "$processedByUser.email",
+        customer: {
+          _id: "$customerDetails._id",
+          first_name: "$customerDetails.first_name",
+          last_name: "$customerDetails.last_name",
+          middle_name: "$customerDetails.middle_name",
+          suffix: "$customerDetails.suffix",
+          email: "$customerDetails.email",
+          gender: "$customerDetails.gender",
+          avatar: "$customerDetails.avatar",
+          full_name: {
+            $concat: [
+              { $ifNull: ["$customerDetails.first_name", ""] },
+              " ",
+              { $ifNull: ["$customerDetails.last_name", ""] }
+            ]
+          }
+        },
         totalItems: { $size: "$bookings" },
         isPartialPayment: { $eq: ["$paymentDetails.paymentType", "partial"] },
         isFullPayment: { $eq: ["$paymentDetails.paymentType", "full"] }
       }
     },
-
-    // =========================
-    // 3. PAGINATION (FACET)
-    // =========================
     {
       $facet: {
         metadata: [{ $count: "total" }],
@@ -866,9 +1052,6 @@ exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
   const billingHistory = results[0].data;
   const totalPages = Math.ceil(totalCount / pageSize);
 
-  // =========================
-  // RESPONSE
-  // =========================
   res.status(200).json({
     success: true,
     totalCount,
@@ -885,7 +1068,23 @@ exports.getBillingHistoryById = AsyncErrorHandler(async (req, res) => {
   const billingHistory = await BillingHistory.aggregate([
     { $match: { _id: new mongoose.Types.ObjectId(id) } },
 
-    // LOOKUP USER WHO PROCESSED
+    //  LOOKUP: Customer details
+    {
+      $lookup: {
+        from: "customers",
+        localField: "customerId",
+        foreignField: "_id",
+        as: "customerDetails"
+      }
+    },
+    {
+      $unwind: {
+        path: "$customerDetails",
+        preserveNullAndEmptyArrays: true
+      }
+    },
+
+    //  LOOKUP: processedBy
     {
       $lookup: {
         from: "userloginschemas",
@@ -900,12 +1099,27 @@ exports.getBillingHistoryById = AsyncErrorHandler(async (req, res) => {
         preserveNullAndEmptyArrays: true
       }
     },
-
-    // ADD COMPUTED FIELDS
     {
       $addFields: {
         processedByName: "$processedByUser.name",
         processedByEmail: "$processedByUser.email",
+        customer: {
+          _id: "$customerDetails._id",
+          first_name: "$customerDetails.first_name",
+          last_name: "$customerDetails.last_name",
+          middle_name: "$customerDetails.middle_name",
+          suffix: "$customerDetails.suffix",
+          email: "$customerDetails.email",
+          gender: "$customerDetails.gender",
+          avatar: "$customerDetails.avatar",
+          full_name: {
+            $concat: [
+              { $ifNull: ["$customerDetails.first_name", ""] },
+              " ",
+              { $ifNull: ["$customerDetails.last_name", ""] }
+            ]
+          }
+        },
         totalItems: { $size: "$bookings" },
         isPartialPayment: { $eq: ["$paymentDetails.paymentType", "partial"] },
         isFullPayment: { $eq: ["$paymentDetails.paymentType", "full"] }
@@ -1001,7 +1215,6 @@ exports.getBillingHistoryByDateRange = AsyncErrorHandler(async (req, res) => {
 exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 
-  // Date filter
   const dateFilter = {};
   if (startDate && endDate) {
     dateFilter["paymentDetails.processedAt"] = {
@@ -1010,9 +1223,6 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
     };
   }
 
-  // =========================
-  // STATUS BREAKDOWN
-  // =========================
   const stats = await BillingHistory.aggregate([
     {
       $match: {
@@ -1031,16 +1241,8 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
     }
   ]);
 
-  // =========================
-  // PAYMENT TYPE BREAKDOWN (NEW)
-  // =========================
   const paymentTypeStats = await BillingHistory.aggregate([
-    {
-      $match: {
-        ...dateFilter,
-        status: "completed"
-      }
-    },
+    { $match: { ...dateFilter, status: "completed" } },
     {
       $group: {
         _id: "$paymentDetails.paymentType",
@@ -1051,16 +1253,8 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
     }
   ]);
 
-  // =========================
-  // DAILY TREND
-  // =========================
   const dailyStats = await BillingHistory.aggregate([
-    {
-      $match: {
-        ...dateFilter,
-        status: "completed"
-      }
-    },
+    { $match: { ...dateFilter, status: "completed" } },
     {
       $group: {
         _id: {
@@ -1072,24 +1266,12 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
         count: { $sum: 1 }
       }
     },
-    {
-      $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 }
-    },
-    {
-      $limit: 30
-    }
+    { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } },
+    { $limit: 30 }
   ]);
 
-  // =========================
-  // PAYMENT METHOD BREAKDOWN
-  // =========================
   const methodStats = await BillingHistory.aggregate([
-    {
-      $match: {
-        ...dateFilter,
-        status: "completed"
-      }
-    },
+    { $match: { ...dateFilter, status: "completed" } },
     {
       $group: {
         _id: "$paymentDetails.method",
@@ -1099,13 +1281,8 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
     }
   ]);
 
-  // =========================
-  // SUMMARY
-  // =========================
   const summary = await BillingHistory.aggregate([
-    {
-      $match: dateFilter
-    },
+    { $match: dateFilter },
     {
       $group: {
         _id: null,
@@ -1118,9 +1295,7 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
             ]
           }
         },
-        totalDue: {
-          $sum: "$paymentDetails.totalAmount"
-        },
+        totalDue: { $sum: "$paymentDetails.totalAmount" },
         totalRefunded: {
           $sum: {
             $cond: [
@@ -1174,7 +1349,8 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-// GET partial payments - with role-based filtering (EXCLUDES pending status)
+// ==================== GET PARTIAL PAYMENTS ====================
+
 exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
   const role = req.user.role;
   const userId = req.user.linkId;
@@ -1187,9 +1363,6 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const pageSize = parseInt(limit);
 
-  // =========================
-  // ✅ VALIDATION: Check if user exists and has proper role
-  // =========================
   if (!role) {
     return res.status(401).json({
       success: false,
@@ -1204,48 +1377,18 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  // =========================
-  // ✅ VALIDATION: Validate pagination parameters
-  // =========================
-  if (parseInt(page) < 1 || parseInt(limit) < 1) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid pagination parameters: page and limit must be positive integers"
-    });
-  }
-
-  if (parseInt(limit) > 100) {
-    return res.status(400).json({
-      success: false,
-      message: "Limit cannot exceed 100 records per page"
-    });
-  }
-
-  // =========================
-  // BUILD MATCH CONDITION - EXCLUDE PENDING STATUS
-  // =========================
   let matchCondition = {
     $and: [
-      {
-        "paymentDetails.paymentType": "partial"
-      },
-      {
-        "paymentDetails.status": { $ne: "pending" } // ✅ EXCLUDE pending status
-      }
+      { "paymentDetails.paymentType": "partial" },
+      { "paymentDetails.status": { $ne: "pending" } }
     ]
   };
 
-  // =========================
-  // IF NOT CUSTOMER - FETCH ALL DATA (NO USER FILTER)
-  // =========================
   if (role && role !== "customer") {
-    console.log("🔍 Staff/Admin - Fetching ALL partial payments (excluding pending)");
-    // Don't add userId filter - fetch everything
-  } else if (userId) {
-    // Customer - filter by userId
+    console.log("🔍 Staff/Admin - Fetching ALL partial payments");
+  } else if (role === "customer") {
     console.log("🔍 Customer - Filtering by user ID:", userId);
 
-    // ✅ VALIDATION: Find the user in UserLoginSchema using the linkId
     const user = await UserLoginSchema.findOne({ linkedId: userId });
 
     if (!user) {
@@ -1255,18 +1398,17 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    console.log("✅ Found user:", user._id);
-    console.log("User ID as string:", user._id.toString());
+    console.log(" Found user:", user._id);
+    console.log("User linkedId (Customer._id):", user.linkedId);
 
-    // Get the user's _id as string
-    const userObjectIdString = user._id.toString();
-
-    // Add customer filter for customer role
+    //  Match by linkedId (Customer._id) OR _id
     matchCondition.$and.push({
-      "bookings.customer._id": userObjectIdString
+      $or: [
+        { customerId: user.linkedId },
+        { customerId: user._id },
+      ]
     });
   } else {
-    console.log("⚠️ No user ID found - returning empty data");
     return res.status(200).json({
       success: true,
       totalCount: 0,
@@ -1277,39 +1419,82 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  console.log("📋 Match Condition:", JSON.stringify(matchCondition, null, 2));
-
-  // =========================
-  // AGGREGATION PIPELINE
-  // =========================
   try {
     const results = await BillingHistory.aggregate([
-      {
-        $match: matchCondition
-      },
+      { $match: matchCondition },
       { $sort: { "paymentDetails.processedAt": -1 } },
+
+      //  LOOKUP: Customer details from "customers"
+      {
+        $lookup: {
+          from: "customers",
+          localField: "customerId",
+          foreignField: "_id",
+          as: "customerDetails"
+        }
+      },
+      {
+        $unwind: {
+          path: "$customerDetails",
+          preserveNullAndEmptyArrays: true
+        }
+      },
+
+      //  I-inject ang customer info sa bawat booking
+      {
+        $addFields: {
+          customer: {
+            _id: "$customerDetails._id",
+            first_name: "$customerDetails.first_name",
+            last_name: "$customerDetails.last_name",
+            middle_name: "$customerDetails.middle_name",
+            suffix: "$customerDetails.suffix",
+            email: "$customerDetails.email",
+            gender: "$customerDetails.gender",
+            avatar: "$customerDetails.avatar",
+            full_name: {
+              $concat: [
+                { $ifNull: ["$customerDetails.first_name", ""] },
+                " ",
+                { $ifNull: ["$customerDetails.last_name", ""] }
+              ]
+            }
+          },
+          bookings: {
+            $map: {
+              input: "$bookings",
+              as: "booking",
+              in: {
+                $mergeObjects: [
+                  "$$booking",
+                  {
+                    customer: {
+                      _id: "$customerDetails._id",
+                      first_name: "$customerDetails.first_name",
+                      last_name: "$customerDetails.last_name",
+                      full_name: {
+                        $concat: [
+                          { $ifNull: ["$customerDetails.first_name", ""] },
+                          " ",
+                          { $ifNull: ["$customerDetails.last_name", ""] }
+                        ]
+                      },
+                      email: "$customerDetails.email"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+
       {
         $facet: {
           metadata: [{ $count: "total" }],
           data: [
             { $skip: skip },
-            { $limit: pageSize },
-            {
-              $project: {
-                _id: 1,
-                transactionId: 1,
-                paymentDetails: 1,
-                bookings: 1,
-                processedBy: 1,
-                metadata: 1,
-                avatar: 1,
-                status: 1,
-                statusHistory: 1,
-                refund: 1,
-                createdAt: 1,
-                updatedAt: 1
-              }
-            }
+            { $limit: pageSize }
           ]
         }
       }
@@ -1319,13 +1504,12 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
     const billingHistory = results[0].data;
     const totalPages = Math.ceil(totalCount / pageSize);
 
-    console.log(`📊 Total Partial Payments (excluding pending): ${totalCount}`);
+    console.log(`📊 Total Partial Payments: ${totalCount}`);
 
-    // ✅ VALIDATION: Check if data exists
     if (billingHistory.length === 0) {
       return res.status(200).json({
         success: true,
-        message: "No partial payments found (excluding pending)",
+        message: "No partial payments found",
         totalCount: 0,
         totalPages: 0,
         currentPage: parseInt(page),
@@ -1336,7 +1520,7 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Successfully retrieved ${billingHistory.length} partial payments (excluding pending)`,
+      message: `Successfully retrieved ${billingHistory.length} partial payments`,
       totalCount,
       totalPages,
       currentPage: parseInt(page),
@@ -1354,17 +1538,16 @@ exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
   }
 });
 
+// ==================== GET FULL PAYMENTS ====================
+
 exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
   const role = req.user.role;
   const userId = req.user.linkId;
-
-  console.log("👤 User Role:", role);
-  console.log("👤 User ID (linkId):", userId);
-
   const { page = 1, limit = 20 } = req.query;
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const pageSize = parseInt(limit);
+
   if (!role) {
     return res.status(401).json({
       success: false,
@@ -1379,43 +1562,18 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  if (parseInt(page) < 1 || parseInt(limit) < 1) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid pagination parameters: page and limit must be positive integers"
-    });
-  }
-
-  if (parseInt(limit) > 100) {
-    return res.status(400).json({
-      success: false,
-      message: "Limit cannot exceed 100 records per page"
-    });
-  }
-
-  // =========================
-  // BUILD MATCH CONDITION - EXCLUDE PENDING STATUS
-  // =========================
   let matchCondition = {
     $and: [
-      {
-        "paymentDetails.paymentType": "full"
-      },
-      {
-        "paymentDetails.status": { $ne: "pending" }
-      }
+      { "paymentDetails.paymentType": "full" },
+      { "paymentDetails.status": { $ne: "pending" } }
     ]
   };
 
-  // ============================================
-  // IF CUSTOMER - GET USER AND ACTION BOOKINGS
-  // ============================================
   let customerActionBookings = [];
 
   if (role === "customer") {
     console.log("🔍 Customer - Filtering by user ID:", userId);
 
-    // ✅ Find the user in UserLoginSchema using the linkId
     const user = await UserLoginSchema.findOne({ linkedId: userId });
 
     if (!user) {
@@ -1425,49 +1583,26 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    console.log("✅ Found user:", user._id);
-    console.log("User ID as string:", user._id.toString());
-
+    console.log(" Found user:", user._id);
     const userObjectIdString = user._id.toString();
-
-    // ============================================
-    // ✅ FIND ACTION BOOKINGS WITH MATCHING CUSTOMER ID
-    // ============================================
-    console.log("🔍 Searching for action bookings with customerId:", userObjectIdString);
 
     customerActionBookings = await actionbooking.find({
       customerId: userObjectIdString
-    }).lean(); // Use lean() for better performance
+    }).lean();
 
     console.log(`📋 Found ${customerActionBookings.length} action booking(s) for customer`);
 
-    // Log details of each action booking found
-    if (customerActionBookings.length > 0) {
-      customerActionBookings.forEach((booking, index) => {
-        console.log(`📋 Action Booking ${index + 1}:`);
-        console.log(`   _id: ${booking._id}`);
-        console.log(`   bookingNumber: ${booking.bookingNumber}`);
-        console.log(`   bookingItemModel: ${booking.bookingItemModel}`);
-        console.log(`   status: ${booking.status}`);
-        console.log(`   amount: ${booking.amount}`);
-        console.log(`   createdAt: ${booking.createdAt}`);
-      });
-    } else {
-      console.log("⚠️ No action bookings found for this customer");
-    }
-
-    // ✅ Add customer filter for billing history
+    //  Match by linkedId (Customer._id) OR _id
     matchCondition.$and.push({
-      "customerId": user._id // Use the main customerId field
+      $or: [
+        { customerId: user.linkedId },
+        { customerId: user._id },
+      ]
     });
 
-    console.log("📋 Match Condition with customer filter:", JSON.stringify(matchCondition, null, 2));
-
   } else if (role && role !== "customer") {
-    console.log("🔍 Staff/Admin - Fetching ALL full payments (excluding pending)");
-    // Don't add userId filter - fetch everything
+    console.log("🔍 Staff/Admin - Fetching ALL full payments");
   } else {
-    console.log("⚠️ No valid role found - returning empty data");
     return res.status(200).json({
       success: true,
       totalCount: 0,
@@ -1478,18 +1613,12 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  // =========================
-  // AGGREGATION PIPELINE
-  // =========================
   try {
     const results = await BillingHistory.aggregate([
-      {
-        $match: matchCondition
-      },
+      { $match: matchCondition },
       { $sort: { "paymentDetails.processedAt": -1 } },
-      // =========================
-      // LOOKUP: Populate customer details
-      // =========================
+
+      //  LOOKUP: Customer details from "customers"
       {
         $lookup: {
           from: "customers",
@@ -1504,18 +1633,14 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
           preserveNullAndEmptyArrays: true
         }
       },
-      // =========================
-      // UNWIND BOOKINGS TO PROCESS EACH ONE
-      // =========================
+
       {
         $unwind: {
           path: "$bookings",
           preserveNullAndEmptyArrays: true
         }
       },
-      // =========================
-      // LOOKUP FOR ACTION BOOKINGS
-      // =========================
+
       {
         $lookup: {
           from: "actionbookings",
@@ -1530,9 +1655,7 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
           preserveNullAndEmptyArrays: true
         }
       },
-      // =========================
-      // GROUP BACK THE BOOKINGS
-      // =========================
+
       {
         $group: {
           _id: "$_id",
@@ -1553,7 +1676,6 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
               $mergeObjects: [
                 "$bookings",
                 {
-                  // Add customer info
                   customerInfo: {
                     _id: "$customerDetails._id",
                     first_name: "$customerDetails.first_name",
@@ -1564,7 +1686,6 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
                     gender: "$customerDetails.gender",
                     avatar: "$customerDetails.avatar"
                   },
-                  // Add action booking details
                   actionBookingDetails: {
                     _id: "$actionBookingDetails._id",
                     bookingNumber: "$actionBookingDetails.bookingNumber",
@@ -1585,9 +1706,7 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
           }
         }
       },
-      // =========================
-      // PROJECT FINAL OUTPUT
-      // =========================
+
       {
         $project: {
           _id: 1,
@@ -1601,9 +1720,9 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
             suffix: "$customerDetails.suffix",
             full_name: {
               $concat: [
-                "$customerDetails.first_name",
+                { $ifNull: ["$customerDetails.first_name", ""] },
                 " ",
-                "$customerDetails.last_name"
+                { $ifNull: ["$customerDetails.last_name", ""] }
               ]
             },
             email: "$customerDetails.email",
@@ -1629,21 +1748,19 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
                 status: "$$booking.status",
                 amount: "$$booking.amount",
                 createdAt: "$$booking.createdAt",
-                // Customer info
                 customer: {
                   _id: "$$booking.customerInfo._id",
                   first_name: "$$booking.customerInfo.first_name",
                   last_name: "$$booking.customerInfo.last_name",
                   full_name: {
                     $concat: [
-                      "$$booking.customerInfo.first_name",
+                      { $ifNull: ["$$booking.customerInfo.first_name", ""] },
                       " ",
-                      "$$booking.customerInfo.last_name"
+                      { $ifNull: ["$$booking.customerInfo.last_name", ""] }
                     ]
                   },
                   email: "$$booking.customerInfo.email"
                 },
-                // Order fields
                 orderId: "$$booking.orderId",
                 orderNumber: "$$booking.orderNumber",
                 orderStatus: "$$booking.orderStatus",
@@ -1655,7 +1772,6 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
                 totals: "$$booking.totals",
                 payment: "$$booking.payment",
                 delivery: "$$booking.delivery",
-                // Booking fields
                 bookingNumber: "$$booking.bookingNumber",
                 bookingItemId: "$$booking.bookingItemId",
                 bookingItemModel: "$$booking.bookingItemModel",
@@ -1666,22 +1782,17 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
                 itemPrice: "$$booking.itemPrice",
                 itemImage: "$$booking.itemImage",
                 itemDetails: "$$booking.itemDetails",
-                // Accommodation specifics
                 accommodationType: "$$booking.accommodationType",
                 minCapacity: "$$booking.minCapacity",
                 maxCapacity: "$$booking.maxCapacity",
                 amenities: "$$booking.amenities",
-                // Rental specifics
                 rentalUnit: "$$booking.rentalUnit",
-                // Service specifics
                 serviceCategory: "$$booking.serviceCategory",
-                // Approver
                 approver: "$$booking.approver",
-                // Payment tracking
                 paymentStatus: "$$booking.paymentStatus",
                 paymentAmount: "$$booking.paymentAmount",
                 remainingBalance: "$$booking.remainingBalance",
-                // Action Booking Details
+                origin: "$$booking.origin",
                 actionBookingDetails: "$$booking.actionBookingDetails"
               }
             }
@@ -1703,13 +1814,10 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
     const billingHistory = results[0]?.data || [];
     const totalPages = Math.ceil(totalCount / pageSize);
 
-    console.log(`📊 Total Full Payments (excluding pending): ${totalCount}`);
-
-    // ✅ VALIDATION: Check if data exists
     if (billingHistory.length === 0) {
       return res.status(200).json({
         success: true,
-        message: "No full payments found (excluding pending)",
+        message: "No full payments found",
         totalCount: 0,
         totalPages: 0,
         currentPage: parseInt(page),
@@ -1718,9 +1826,6 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // ============================================
-    // ✅ PREPARE ACTION BOOKINGS SUMMARY
-    // ============================================
     let actionBookingsSummary = null;
 
     if (role === "customer" && customerActionBookings.length > 0) {
@@ -1741,7 +1846,7 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Successfully retrieved ${billingHistory.length} full payments (excluding pending)`,
+      message: `Successfully retrieved ${billingHistory.length} full payments`,
       totalCount,
       totalPages,
       currentPage: parseInt(page),
@@ -1760,22 +1865,17 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
   }
 });
 
-// GET verify payments with pending status - with role-based filtering
+// ==================== GET VERIFY PAYMENTS ====================
+
 exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
   const role = req.user.role;
   const userId = req.user.linkId;
-
-  console.log("👤 User Role:", role);
-  console.log("👤 User ID:", userId);
 
   const { page = 1, limit = 20 } = req.query;
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const pageSize = parseInt(limit);
 
-  // =========================
-  // ✅ VALIDATION: Check if user exists and has proper role
-  // =========================
   if (!role) {
     return res.status(401).json({
       success: false,
@@ -1790,26 +1890,6 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  // =========================
-  // ✅ VALIDATION: Validate pagination parameters
-  // =========================
-  if (parseInt(page) < 1 || parseInt(limit) < 1) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid pagination parameters: page and limit must be positive integers"
-    });
-  }
-
-  if (parseInt(limit) > 100) {
-    return res.status(400).json({
-      success: false,
-      message: "Limit cannot exceed 100 records per page"
-    });
-  }
-
-  // =========================
-  // BUILD MATCH CONDITION - Filter ONLY PENDING status
-  // =========================
   let matchCondition = {
     $and: [
       {
@@ -1818,21 +1898,13 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
           { "paymentDetails.paymentType": "full" }
         ]
       },
-      { "paymentDetails.status": "pending" } // ✅ Filter only PENDING status
+      { "paymentDetails.status": "pending" }
     ]
   };
 
-  // =========================
-  // IF NOT CUSTOMER - FETCH ALL DATA (NO USER FILTER)
-  // =========================
   if (role && role !== "customer") {
-    console.log("🔍 Staff/Admin - Fetching ALL pending verify payments (no user filter)");
-    // Don't add userId filter - fetch everything
-  } else if (userId) {
-    // Customer - filter by userId
-    console.log("🔍 Customer - Filtering by user ID:", userId);
-
-    // ✅ VALIDATION: Find the user in UserLoginSchema using the linkId
+    console.log("🔍 Staff/Admin - Fetching ALL pending verify payments");
+  } else if (role === "customer") {
     const user = await UserLoginSchema.findOne({ linkedId: userId });
 
     if (!user) {
@@ -1842,18 +1914,16 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    console.log("✅ Found user:", user._id);
-    console.log("User ID as string:", user._id.toString());
+    console.log(" Found user:", user._id);
 
-    // Get the user's _id as string
-    const userObjectIdString = user._id.toString();
-
-    // Add customer filter for customer role
+    //  Match by linkedId (Customer._id) OR _id
     matchCondition.$and.push({
-      "bookings.customer._id": userObjectIdString
+      $or: [
+        { customerId: user.linkedId },
+        { customerId: user._id },
+      ]
     });
   } else {
-    console.log("⚠️ No user ID found - returning empty data");
     return res.status(200).json({
       success: true,
       totalCount: 0,
@@ -1864,39 +1934,81 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  console.log("📋 Match Condition:", JSON.stringify(matchCondition, null, 2));
-
-  // =========================
-  // AGGREGATION PIPELINE
-  // =========================
   try {
     const results = await BillingHistory.aggregate([
-      {
-        $match: matchCondition
-      },
+      { $match: matchCondition },
       { $sort: { "paymentDetails.processedAt": -1 } },
+
+      //  LOOKUP: Customer details from "customers"
+      {
+        $lookup: {
+          from: "customers",
+          localField: "customerId",
+          foreignField: "_id",
+          as: "customerDetails"
+        }
+      },
+      {
+        $unwind: {
+          path: "$customerDetails",
+          preserveNullAndEmptyArrays: true
+        }
+      },
+
+      {
+        $addFields: {
+          customer: {
+            _id: "$customerDetails._id",
+            first_name: "$customerDetails.first_name",
+            last_name: "$customerDetails.last_name",
+            middle_name: "$customerDetails.middle_name",
+            suffix: "$customerDetails.suffix",
+            email: "$customerDetails.email",
+            gender: "$customerDetails.gender",
+            avatar: "$customerDetails.avatar",
+            full_name: {
+              $concat: [
+                { $ifNull: ["$customerDetails.first_name", ""] },
+                " ",
+                { $ifNull: ["$customerDetails.last_name", ""] }
+              ]
+            }
+          },
+          bookings: {
+            $map: {
+              input: "$bookings",
+              as: "booking",
+              in: {
+                $mergeObjects: [
+                  "$$booking",
+                  {
+                    customer: {
+                      _id: "$customerDetails._id",
+                      first_name: "$customerDetails.first_name",
+                      last_name: "$customerDetails.last_name",
+                      full_name: {
+                        $concat: [
+                          { $ifNull: ["$customerDetails.first_name", ""] },
+                          " ",
+                          { $ifNull: ["$customerDetails.last_name", ""] }
+                        ]
+                      },
+                      email: "$customerDetails.email"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+
       {
         $facet: {
           metadata: [{ $count: "total" }],
           data: [
             { $skip: skip },
-            { $limit: pageSize },
-            {
-              $project: {
-                _id: 1,
-                transactionId: 1,
-                paymentDetails: 1,
-                bookings: 1,
-                processedBy: 1,
-                metadata: 1,
-                avatar: 1,
-                status: 1,
-                statusHistory: 1,
-                refund: 1,
-                createdAt: 1,
-                updatedAt: 1
-              }
-            }
+            { $limit: pageSize }
           ]
         }
       }
@@ -1906,9 +2018,6 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
     const billingHistory = results[0].data;
     const totalPages = Math.ceil(totalCount / pageSize);
 
-    console.log(`📊 Total Pending Verify Payments (Partial/Full): ${totalCount}`);
-
-    // ✅ VALIDATION: Check if data exists
     if (billingHistory.length === 0) {
       return res.status(200).json({
         success: true,
@@ -1941,14 +2050,14 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
   }
 });
 
-// ==================== UPDATE ====================
-
 exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
   try {
     const { id } = req.params;
     const { status, note } = req.body;
     const userId = req.user?._id || "system";
     const userName = req.user?.name || "System";
+
+    console.log("status", status)
 
     if (!status) {
       return res.status(400).json({
@@ -1957,7 +2066,7 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    const validStatuses = ["pending", "verified", "completed", "failed", "refunded", "partial"];
+    const validStatuses = ["pending", "verified", "completed", "failed", "refunded", "partial", "paid"];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
@@ -1974,7 +2083,6 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Update status
     billingHistory.status = status;
     billingHistory.statusHistory.push({
       status,
@@ -1983,12 +2091,10 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
       updatedBy: { userId, userName }
     });
 
-    // If status is completed, update payment details status
     if (status === "completed") {
       billingHistory.paymentDetails.status = "completed";
     }
 
-    // If status is partial, update remaining balance
     if (status === "partial") {
       const totalPaid = billingHistory.paymentDetails.paymentAmount;
       const totalDue = billingHistory.paymentDetails.totalAmount;
@@ -1997,9 +2103,6 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
 
     await billingHistory.save();
 
-    // =========================
-    // SOCKET EMIT
-    // =========================
     const io = req.app.get("socketio");
 
     if (io) {
@@ -2010,13 +2113,8 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
 
       io.to("admin").emit("billingStatusUpdated", payload);
       io.to("finance").emit("billingStatusUpdated", payload);
-
-      console.log("📡 BILLING STATUS EMITTED TO ADMIN + FINANCE");
     }
 
-    // =========================
-    // NOTIFICATION
-    // =========================
     const notification = await Notification.create({
       message: `Billing ${billingHistory.transactionId} status updated to ${status}`,
       FileId: billingHistory._id,
@@ -2040,8 +2138,33 @@ exports.updateBillingStatus = AsyncErrorHandler(async (req, res) => {
       io.to(userRoom).emit("newNotification", notifPayload);
       io.to("admin").emit("newNotification", notifPayload);
       io.to("finance").emit("newNotification", notifPayload);
+    }
 
-      console.log("🔔 NOTIFICATION SENT");
+    // ==================== SEND EMAIL ONLY WHEN STATUS IS "paid" ====================
+    if (status === "paid") {
+      const customerId = billingHistory.processedBy?.userId;
+
+      if (!customerId) {
+        console.warn("⚠️ No customerId found in billingHistory.processedBy");
+      } else {
+        // Hanapin ang user sa UserLoginSchema gamit ang linkedId = customerId
+        const userLogin = await UserLoginSchema.findOne({
+          linkedId: customerId
+        }).select("username linkedId");
+
+        if (!userLogin || !userLogin.username) {
+          console.warn(`⚠️ No user login found for linkedId: ${customerId}`);
+        } else {
+          // Send email
+          await sendEmail({
+            email: userLogin.username, // username field holds the email
+            subject: "Please Check your email",
+            text: `Billing ${billingHistory.transactionId} status updated to ${status}`,
+          });
+
+          console.log(`📧 Email sent to ${userLogin.username} for billing ${billingHistory.transactionId}`);
+        }
+      }
     }
 
     res.status(200).json({
@@ -2090,7 +2213,6 @@ exports.processRefund = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // For partial payments, only refund the amount paid
     const refundAmount = amount || billingHistory.paymentDetails.paymentAmount;
 
     if (refundAmount > billingHistory.paymentDetails.paymentAmount) {
@@ -2107,7 +2229,6 @@ exports.processRefund = AsyncErrorHandler(async (req, res) => {
       reason || "Customer requested refund"
     );
 
-    // Update remaining balance if partial payment
     if (billingHistory.paymentDetails.paymentType === "partial") {
       billingHistory.paymentDetails.remainingBalance =
         billingHistory.paymentDetails.totalAmount - billingHistory.paymentDetails.paymentAmount;
@@ -2115,9 +2236,6 @@ exports.processRefund = AsyncErrorHandler(async (req, res) => {
 
     await billingHistory.save();
 
-    // =========================
-    // SOCKET EMIT
-    // =========================
     const io = req.app.get("socketio");
 
     if (io) {
@@ -2128,8 +2246,6 @@ exports.processRefund = AsyncErrorHandler(async (req, res) => {
 
       io.to("admin").emit("billingRefunded", payload);
       io.to("finance").emit("billingRefunded", payload);
-
-      console.log("📡 REFUND EMITTED TO ADMIN + FINANCE");
     }
 
     res.status(200).json({
@@ -2188,7 +2304,6 @@ exports.updateBillingNotes = AsyncErrorHandler(async (req, res) => {
   }
 });
 
-// NEW: Add partial payment to existing billing
 exports.addPartialPayment = AsyncErrorHandler(async (req, res) => {
   try {
     const { id } = req.params;
@@ -2235,12 +2350,10 @@ exports.addPartialPayment = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Update payment details
     billingHistory.paymentDetails.paymentAmount += additionalAmount;
     billingHistory.paymentDetails.remainingBalance =
       billingHistory.paymentDetails.totalAmount - billingHistory.paymentDetails.paymentAmount;
 
-    // Update each booking's payment amount proportionally
     const totalPaid = billingHistory.paymentDetails.paymentAmount;
     const totalDue = billingHistory.paymentDetails.totalAmount;
 
@@ -2250,7 +2363,6 @@ exports.addPartialPayment = AsyncErrorHandler(async (req, res) => {
       booking.remainingBalance = booking.amount - booking.paymentAmount;
     });
 
-    // If remaining balance is 0, mark as completed
     if (billingHistory.paymentDetails.remainingBalance === 0) {
       billingHistory.status = "completed";
       billingHistory.paymentDetails.paymentType = "full";
@@ -2270,7 +2382,6 @@ exports.addPartialPayment = AsyncErrorHandler(async (req, res) => {
 
     await billingHistory.save();
 
-    // Socket emit and notification
     const io = req.app.get("socketio");
     if (io) {
       io.to("admin").emit("billingUpdated", { billingHistory });
@@ -2310,7 +2421,6 @@ exports.deleteBillingHistory = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Soft delete - mark as deleted instead of removing
     billingHistory.status = "deleted";
     billingHistory.statusHistory.push({
       status: "deleted",
@@ -2371,7 +2481,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
 
     console.log("📋 Update Payment Status Request:", { billingId, status });
 
-    // Validate required fields
     if (!billingId) {
       return res.status(400).json({
         success: false,
@@ -2386,7 +2495,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Validate billingId format
     if (!mongoose.Types.ObjectId.isValid(billingId)) {
       return res.status(400).json({
         success: false,
@@ -2394,7 +2502,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // Validate status
     const validStatuses = ['pending', 'verified', 'completed', 'rejected', 'cancelled', 'refunded', 'partial'];
     if (!validStatuses.includes(status)) {
       console.log(`⚠️ Warning: Status "${status}" is not in the standard list. Allowing anyway.`);
@@ -2402,7 +2509,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
 
     console.log(`📌 Updating paymentDetails.status to: ${status}`);
 
-    // Find the billing record
     const billing = await BillingHistory.findById(billingId);
     if (!billing) {
       return res.status(404).json({
@@ -2416,7 +2522,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
     console.log(`Current remainingBalance: ${billing.paymentDetails?.remainingBalance}`);
     console.log(`New status: ${status}`);
 
-    // Check if status is already the same
     if (billing.paymentDetails?.status === status) {
       console.log(`ℹ️ Status is already "${status}". No changes needed.`);
       return res.status(200).json({
@@ -2427,9 +2532,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
-    // ============================================
-    // DETERMINE IF FULLY PAID OR PARTIALLY PAID
-    // ============================================
     const remainingBalance = billing.paymentDetails?.remainingBalance || 0;
     const isFullyPaid = remainingBalance <= 0;
     const paymentType = isFullyPaid ? "full" : "partial";
@@ -2437,18 +2539,13 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
 
     console.log(`💰 Remaining Balance: ₱${remainingBalance.toFixed(2)}`);
     console.log(`💳 Payment Type: ${paymentType.toUpperCase()}`);
-    console.log(`✅ Is Fully Paid: ${isFullyPaid}`);
+    console.log(` Is Fully Paid: ${isFullyPaid}`);
     console.log(`📊 Billing Status: ${billingStatus}`);
 
-    // ============================================
-    // PREPARE UPDATE DATA
-    // ============================================
     const updateData = {
       $set: {
         "paymentDetails.status": status,
-        // Update paymentType based on remaining balance
         "paymentDetails.paymentType": paymentType,
-        // Update root status
         "status": billingStatus
       },
       $push: {
@@ -2456,7 +2553,7 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
           status: billingStatus,
           timestamp: new Date(),
           note: isFullyPaid
-            ? `✅ Payment verified and FULLY PAID! Remaining balance: ₱0.00`
+            ? ` Payment verified and FULLY PAID! Remaining balance: ₱0.00`
             : `⏳ Payment verified but PARTIALLY PAID. Remaining balance: ₱${remainingBalance.toFixed(2)}`,
           updatedBy: {
             userId: req.user?._id || "system",
@@ -2466,21 +2563,14 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       }
     };
 
-    // ✅ Update paymentDetails.status and other fields
     const updatedBilling = await BillingHistory.findByIdAndUpdate(
       billingId,
       updateData,
       { new: true, runValidators: true }
     );
 
-    console.log(`✅ Updated paymentDetails.status to: ${status}`);
-    console.log(`✅ Updated paymentDetails.paymentType to: ${paymentType}`);
-    console.log(`✅ Updated root status to: ${billingStatus}`);
-    console.log(`✅ Is Fully Paid: ${isFullyPaid}`);
+    console.log(` Updated paymentDetails.status to: ${status}`);
 
-    // ============================================
-    // UPDATE BOOKINGS STATUS IF FULLY PAID
-    // ============================================
     if (isFullyPaid) {
       const bookingIds = updatedBilling.bookings
         .map(booking => booking._id)
@@ -2500,7 +2590,7 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
           );
 
           if (updatedActionBookings.modifiedCount > 0) {
-            console.log(`✅ Updated ${updatedActionBookings.modifiedCount} action booking(s) status to "Paid"`);
+            console.log(` Updated ${updatedActionBookings.modifiedCount} action booking(s) status to "Paid"`);
           }
         } catch (updateError) {
           console.error("⚠️ Error updating action bookings:", updateError);
@@ -2519,7 +2609,7 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
           );
 
           if (updatedOrders.modifiedCount > 0) {
-            console.log(`✅ Updated ${updatedOrders.modifiedCount} order(s) status to "Paid"`);
+            console.log(` Updated ${updatedOrders.modifiedCount} order(s) status to "Paid"`);
           }
         } catch (updateError) {
           console.error("⚠️ Error updating orders:", updateError);
@@ -2527,13 +2617,12 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       }
     }
 
-    // Socket emit
     const io = req.app.get("socketio");
     if (io) {
       const payload = {
         billingHistory: updatedBilling,
         message: isFullyPaid
-          ? `✅ Billing ${updatedBilling.transactionId} is now FULLY PAID!`
+          ? ` Billing ${updatedBilling.transactionId} is now FULLY PAID!`
           : `⏳ Payment status updated to "${status}" for ${updatedBilling.transactionId} (Partial)`,
         previousStatus: billing.paymentDetails?.status,
         newStatus: status,
@@ -2545,10 +2634,8 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       io.to("admin").emit("updateBilling", payload);
       io.to("finance").emit("updateBilling", payload);
       io.to("receptionist").emit("updateBilling", payload);
-      console.log(`📡 BILLING UPDATE EMITTED TO ADMIN + FINANCE + RECEPTIONIST`);
     }
 
-    // Create notification
     const staffMembers = await UserLoginSchema.find({
       role: { $in: ["admin", "finance", "receptionist"] }
     }).select("_id");
@@ -2559,7 +2646,7 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
     }));
 
     const updaterName = req.user?.name || req.user?.username || "System";
-    const statusDisplay = isFullyPaid ? "FULLY PAID ✅" : "PARTIALLY PAID ⏳";
+    const statusDisplay = isFullyPaid ? "FULLY PAID " : "PARTIALLY PAID ⏳";
 
     const newNotification = await Notification.create({
       message: `${updaterName} updated payment status to "${status}" (${statusDisplay}) for ${updatedBilling.transactionId}`,
@@ -2579,7 +2666,33 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       io.to("admin").emit("newNotification", notifPayload);
       io.to("finance").emit("newNotification", notifPayload);
       io.to("receptionist").emit("newNotification", notifPayload);
-      console.log("🔔 NOTIFICATION EMITTED TO ADMIN + FINANCE + RECEPTIONIST");
+    }
+
+    // ==================== SEND EMAIL ONLY WHEN STATUS IS "completed" ====================
+    if (status === "completed") {
+      const customerId = updatedBilling.processedBy?.userId;
+
+      if (!customerId) {
+        console.warn("⚠️ No customerId found in billingHistory.processedBy");
+      } else {
+        // Hanapin ang user sa UserLoginSchema gamit ang linkedId = customerId
+        const userLogin = await UserLoginSchema.findOne({
+          linkedId: customerId
+        }).select("username linkedId");
+
+        if (!userLogin || !userLogin.username) {
+          console.warn(`⚠️ No user login found for linkedId: ${customerId}`);
+        } else {
+          // Send email
+          await sendEmail({
+            email: userLogin.username, // username field holds the email
+            subject: "Please Check your email",
+            text: `Billing ${updatedBilling.transactionId} status updated to ${status}`,
+          });
+
+          console.log(`📧 Email sent to ${userLogin.username} for billing ${updatedBilling.transactionId}`);
+        }
+      }
     }
 
     res.status(200).json({

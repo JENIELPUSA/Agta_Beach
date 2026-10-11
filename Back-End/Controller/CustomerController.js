@@ -30,16 +30,71 @@ exports.createCustomer = AsyncErrorHandler(async (req, res) => {
 });
 
 
-exports.getAllCustomers = AsyncErrorHandler(async (req, res) => {
-  const customers = await Customer.find().sort({ created_at: -1 });
+// controllers/customerController.js
 
+exports.getAllCustomers = AsyncErrorHandler(async (req, res) => {
+  // ─── 1. Extract & sanitize query params ─────────────────────────
+  const {
+    search = "",
+    page = 1,
+    limit = 10,
+    status,
+    customerType,
+    sortBy = "createdAt",
+    sortOrder = "desc",
+  } = req.query;
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+  const skip = (pageNum - 1) * limitNum;
+
+  // ─── 2. Build query object ──────────────────────────────────────
+  const query = {};
+
+  // Search across multiple fields (case-insensitive)
+  if (search.trim()) {
+    const escaped = search
+      .trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // escape regex chars
+
+    query.$or = [
+      { name: { $regex: escaped, $options: "i" } },
+      { email: { $regex: escaped, $options: "i" } },
+      { phone: { $regex: escaped, $options: "i" } },
+      { company: { $regex: escaped, $options: "i" } },
+    ];
+  }
+
+  // Optional filters
+  if (status) query.status = status;
+  if (customerType) query.customerType = customerType;
+
+  // ─── 3. Sorting ─────────────────────────────────────────────────
+  const allowedSortFields = ["createdAt", "name", "email", "company"];
+  const sortField = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
+  const sortDir = sortOrder === "asc" ? 1 : -1;
+
+  // ─── 4. Execute queries in parallel ─────────────────────────────
+  const [totalRecords, customers] = await Promise.all([
+    Customer.countDocuments(query),
+    Customer.find(query)
+      .sort({ [sortField]: sortDir })
+      .skip(skip)
+      .limit(limitNum)
+      .lean(),
+  ]);
+
+  // ─── 5. Response ────────────────────────────────────────────────
   res.status(200).json({
     success: true,
-    count: customers.length,
+    totalRecords,
+    currentPage: pageNum,
+    totalPages: Math.ceil(totalRecords / limitNum),
+    limit: limitNum,
+    count: customers.length, // count sa current page lang
     data: customers,
   });
 });
-
 
 exports.getSingleCustomer = AsyncErrorHandler(async (req, res) => {
   const customer = await Customer.findById(req.params.id);

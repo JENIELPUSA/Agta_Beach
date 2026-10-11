@@ -150,37 +150,40 @@ const PaymentSchema = new mongoose.Schema(
 );
 
 // ======================
-// DELIVERY SCHEMA
+// STATUS TRACKING SCHEMA (SIMPLIFIED)
 // ======================
-const DeliverySchema = new mongoose.Schema(
+//  status  → ang status value (pending, processing, for delivery, completed, cancelled)
+//  action  → human-readable action (e.g., "Order Placed")
+//  date    → kailan nangyari
+const StatusTrackingSchema = new mongoose.Schema(
     {
-        roomNumber: {
-            type: String,
-            required: true,
-        },
-
         status: {
             type: String,
             enum: [
                 "pending",
-                "preparing",
-                "ready", "processing", "shipped", "delivered",
-                "delivering",
+                "processing",
+                "for delivery",
                 "completed",
                 "cancelled",
             ],
-            default: "pending",
+            required: true,
         },
 
-        notes: {
+        action: {
             type: String,
-            default: "",
+            required: true,
+            trim: true,
+        },
+
+        date: {
+            type: Date,
+            default: Date.now,
         },
     },
     { _id: false }
 );
 
-// ======================
+// =====================
 // ORDER SCHEMA
 // ======================
 const OrderSchema = new mongoose.Schema(
@@ -207,14 +210,18 @@ const OrderSchema = new mongoose.Schema(
             type: String,
             enum: [
                 "pending",
-                "accepted",
-                "preparing",
-                "ready",
-                "delivering",
+                "processing",
+                "for delivery",
                 "completed",
                 "cancelled",
             ],
             default: "pending",
+        },
+
+        //  STATUS TRACKING ARRAY — status, action, date lang
+        statusTracking: {
+            type: [StatusTrackingSchema],
+            default: [],
         },
 
         customer: {
@@ -237,8 +244,9 @@ const OrderSchema = new mongoose.Schema(
             required: true,
         },
 
-        delivery: {
-            type: DeliverySchema,
+        deliveryId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Accommodation",
             required: true,
         },
 
@@ -252,5 +260,70 @@ const OrderSchema = new mongoose.Schema(
         versionKey: false,
     }
 );
+
+// ======================
+// STATUS TRACKING MIDDLEWARE
+// ======================
+// Awtomatikong nag-pupush ng { status, action, date } sa `statusTracking`
+OrderSchema.pre("save", function (next) {
+    try {
+        // CASE 1: Bagong order — i-log ang initial status
+        if (this.isNew) {
+            this.statusTracking = this.statusTracking || [];
+            this.statusTracking.push({
+                status: this.status || "pending",
+                action: getStatusAction(this.status || "pending"),
+                date: new Date(),
+            });
+            return next();
+        }
+
+        // CASE 2: Existing order — check kung nagbago ang status
+        const modifiedPaths = this.modifiedPaths();
+
+        if (modifiedPaths.includes("status")) {
+            this.statusTracking = this.statusTracking || [];
+            this.statusTracking.push({
+                status: this.status,
+                action: getStatusAction(this.status),
+                date: new Date(),
+            });
+        }
+
+        return next();
+    } catch (err) {
+        return next(err);
+    }
+});
+
+// ======================
+// HELPER: Human-readable action base sa status
+// ======================
+function getStatusAction(status) {
+    switch (status?.toLowerCase()) {
+        case "pending":
+            return "Order Placed";
+        case "processing":
+            return "Order is being processed";
+        case "for delivery":
+            return "Order is out for delivery";
+        case "completed":
+            return "Order Completed";
+        case "cancelled":
+            return "Order Cancelled";
+        default:
+            return "Status Updated";
+    }
+}
+
+// ======================
+// METHOD: Itakda ang status update
+// ======================
+// Gamitin ito sa controller bago mag .save():
+//   order.setStatusUpdate("processing");
+OrderSchema.methods.setStatusUpdate = function (newStatus) {
+    this.status = newStatus;
+    return this;
+};
 
 module.exports = mongoose.model("Order", OrderSchema);

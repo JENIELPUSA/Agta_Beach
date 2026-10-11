@@ -326,12 +326,14 @@ exports.updateCartItemQuantity = AsyncErrorHandler(async (req, res, next) => {
 // REMOVE SINGLE ITEM FROM CART
 // ======================
 exports.removeFromCart = AsyncErrorHandler(async (req, res, next) => {
-    console.log("TRigger!!!")
+    console.log("🔔 [removeFromCart] Triggered");
+    
     const userId = getUserId(req);
     const { foodId } = req.params;
 
     if (!foodId) {
         return res.status(400).json({
+            success: false,
             status: "fail",
             message: "Food ID parameter is required.",
         });
@@ -341,6 +343,7 @@ exports.removeFromCart = AsyncErrorHandler(async (req, res, next) => {
 
     if (!cart) {
         return res.status(404).json({
+            success: false,
             status: "fail",
             message: "Cart not found.",
         });
@@ -353,11 +356,13 @@ exports.removeFromCart = AsyncErrorHandler(async (req, res, next) => {
 
     if (cart.items.length === initialLength) {
         return res.status(404).json({
+            success: false,
             status: "fail",
             message: "Item was not found in cart.",
         });
     }
 
+    // ✅ HUWAG i-delete ang cart kahit empty — i-save lang
     await cart.save();
 
     await cart.populate({
@@ -366,9 +371,11 @@ exports.removeFromCart = AsyncErrorHandler(async (req, res, next) => {
     });
 
     res.status(200).json({
+        success: true,          // ✅ IDINAGDAG
         status: "success",
         message: "Item removed from cart successfully.",
         data: cart,
+        isEmpty: cart.items.length === 0,   // ✅ IDINAGDAG (info lang)
     });
 });
 

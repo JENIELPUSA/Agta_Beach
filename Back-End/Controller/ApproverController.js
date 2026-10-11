@@ -1,6 +1,5 @@
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 const Approver = require("../Models/ApproverSchema");
-const Apifeatures = require("../Utils/ApiFeatures");
 
 exports.createApprover = AsyncErrorHandler(async (req, res) => {
   const existingApprover = await Approver.findOne();

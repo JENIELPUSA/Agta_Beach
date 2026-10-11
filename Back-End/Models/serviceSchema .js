@@ -1,10 +1,13 @@
 const mongoose = require("mongoose");
+
 const serviceSchema = new mongoose.Schema(
   {
-    avatar: {
-      url: String,
-      public_id: String,
-    },
+    avatar: [
+      {
+        url: String,
+        public_id: String,
+      },
+    ],
     name: String, // Coffee
 
     price: Number,

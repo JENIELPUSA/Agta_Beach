@@ -4,6 +4,7 @@ const Approver = require("../Models/ApproverSchema");
 const Customer = require("../Models/CustomerSchema");
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 const axios = require("axios");
+const mongoose = require("mongoose");
 const CustomError = require("../Utils/CustomError");
 const jwt = require("jsonwebtoken");
 const util = require("util");
@@ -11,6 +12,7 @@ const fs = require("fs");
 const FormData = require("form-data");
 const crypto = require("crypto");
 const sendEmail = require("./../Utils/email");
+const ActionBooking = require("./../Models/ActionBooking")
 const Cart = require("../Models/cartModel")
 const signToken = (id, role, linkId) => {
   return jwt.sign({ id, role, linkId }, process.env.SECRET_STR, {
@@ -39,6 +41,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
     const requiredFieldsByRole = {
       customer: ["first_name", "last_name", "email", "gender"],
       receptionist: ["first_name", "last_name", "email"],
+      staff: ["first_name", "last_name", "email"],
       admin: ["first_name", "last_name", "email"],
       user: ["first_name", "last_name", "email"],
     };
@@ -114,7 +117,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
         gender,
         contact_number,
       });
-    } else if (selectedRole === "admin" || selectedRole === "receptionist") {
+    } else if (selectedRole === "admin" || selectedRole === "receptionist" || selectedRole === "staff") {
       linkedRecord = await Admin.create({
         avatar,
         first_name,
@@ -384,7 +387,7 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
 
           cart = existingCart;
           await cart.save();
-          console.log("✅ Cart updated successfully");
+          console.log(" Cart updated successfully");
         } else {
           // No existing cart - create new one
           console.log("🆕 Creating new cart for user:", user._id);
@@ -394,7 +397,7 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
             created_at: new Date(),
           });
           await cart.save();
-          console.log("✅ New cart created successfully");
+          console.log(" New cart created successfully");
         }
 
         // Get populated cart for response
@@ -415,7 +418,7 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
           totalPrice: populatedCart.items.reduce((sum, item) => sum + (item.foodId.price * item.quantity), 0),
         };
 
-        console.log("✅ Cart saved during login:", savedCart);
+        console.log(" Cart saved during login:", savedCart);
 
         // Log any errors (non-blocking)
         if (errors.length > 0) {
@@ -616,6 +619,267 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
     token,
     data: {
       user,
+    },
+  });
+});
+
+
+
+exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
+  // ============================================================
+  // 1. Kunin ang ActionBooking _id mula sa URL param
+  // ============================================================
+  const id = req.params.id;
+
+  // ============================================================
+  // 2. Kunin ang linkId mula sa context
+  // ============================================================
+  const linkId = req.user.linkId;
+
+  // ============================================================
+  // 3. Validate: Kailangan meron ang id
+  // ============================================================
+  if (!id) {
+    return next(
+      new CustomError("Please provide a location ID in the URL.", 400)
+    );
+  }
+
+  // ============================================================
+  // 4. Validate: Tamang MongoDB ObjectId ba?
+  // ============================================================
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new CustomError("Invalid location ID format.", 400));
+  }
+
+  // ============================================================
+  // 5. Validate: linkId
+  // ============================================================
+  if (!linkId) {
+    return next(new CustomError("User not authenticated.", 401));
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return next(new CustomError("Invalid user link ID format.", 400));
+  }
+
+  // ============================================================
+  // 6. Hanapin ang UserLogin gamit ang linkedId
+  // ============================================================
+  const user = await UserLogin.findOne({ linkedId: linkId });
+
+  if (!user) {
+    return next(
+      new CustomError("User account not found for this link ID.", 404)
+    );
+  }
+
+  // ============================================================
+  // 7. Hanapin ang ActionBooking at i-validate
+  // ============================================================
+  const booking = await ActionBooking.findById(id);
+
+  if (!booking) {
+    return next(new CustomError("Booking not found.", 404));
+  }
+
+  // ============================================================
+  // 8. Verify ownership
+  // ============================================================
+  if (String(booking.customerId) !== String(user._id)) {
+    return next(
+      new CustomError("This booking does not belong to you.", 403)
+    );
+  }
+
+  // ============================================================
+  // 9. Validate: Accommodation lang ang pwedeng maging default location
+  // ============================================================
+  if (booking.bookingItemModel !== "Accommodation") {
+    return next(
+      new CustomError(
+        "Only Accommodation bookings can be set as default location.",
+        400
+      )
+    );
+  }
+
+  // ============================================================
+  // 10. ✅ Validate: Active status lang
+  //     UPDATED: CheckIn na (dati: Confirmed)
+  // ============================================================
+  const activeStatuses = ["Pending", "CheckIn", "waiting", "Paid"];
+
+  if (!activeStatuses.includes(booking.status)) {
+    return next(
+      new CustomError(
+        `Cannot set default: booking status is "${booking.status}". ` +
+        `Only active bookings can be set as default.`,
+        400
+      )
+    );
+  }
+
+  // ============================================================
+  // 11. ✅ Validate: Hindi pa tapos (isDone)
+  // ============================================================
+  if (booking.isDone) {
+    return next(
+      new CustomError("Cannot set default: booking is already done.", 400)
+    );
+  }
+
+  // ============================================================
+  // 12. ✅ I-UNSET ang lahat ng existing setdefault: true ng user
+  //     (para isa lang ang default)
+  // ============================================================
+  await ActionBooking.updateMany(
+    {
+      customerId: user._id,
+      _id: { $ne: booking._id },      // ✅ Huwag galawin ang bagong default
+      setdefault: true,               // ✅ Yung may default lang
+    },
+    {
+      $set: { setdefault: false },
+    }
+  );
+
+  // ============================================================
+  // 13. ✅ I-SET ang bagong default sa ActionBooking
+  // ============================================================
+  const updatedBooking = await ActionBooking.findByIdAndUpdate(
+    booking._id,
+    {
+      $set: {
+        setdefault: true,
+        updatedAt: Date.now(),
+      },
+    },
+    {
+      new: true,
+      runValidators: true,
+    }
+  );
+
+  if (!updatedBooking) {
+    return next(new CustomError("Failed to update booking.", 500));
+  }
+
+  console.log(
+    "✅ [setdefaultlocation] Default set on booking:",
+    updatedBooking.bookingNumber
+  );
+
+  // ============================================================
+  // 14. Return success
+  // ============================================================
+  res.status(200).json({
+    success: true,
+    message: "Default location set successfully.",
+    action: "set",
+    data: {
+      isdefaultlocation: {
+        _id: updatedBooking._id,
+        bookingNumber: updatedBooking.bookingNumber,
+        bookingItemId: updatedBooking.bookingItemId,
+        bookingItemModel: updatedBooking.bookingItemModel,
+        status: updatedBooking.status,
+        setdefault: updatedBooking.setdefault,
+      },
+    },
+  });
+});
+
+
+// ======================
+// GET DEFAULT LOCATION (Using $lookup)
+// ======================
+exports.Getdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
+  const linkId = req.user.linkId;
+
+  console.log("🔍 [Getdefaultlocation] linkId:", linkId);
+
+  if (!linkId) {
+    return next(new CustomError("User not authenticated.", 401));
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return next(new CustomError("Invalid user link ID format.", 400));
+  }
+
+  // ============================================================
+  // ✅ AGGREGATION with $lookup
+  // ============================================================
+  const result = await UserLogin.aggregate([
+    // ✅ 1. Hanapin ang user via linkedId
+    {
+      $match: {
+        linkedId: new mongoose.Types.ObjectId(linkId),
+      },
+    },
+
+    // ✅ 2. $lookup — i-join ang ActionBooking via isdefaultlocation
+    {
+      $lookup: {
+        from: "actionbookings",              // ✅ collection name (lowercase + plural)
+        localField: "isdefaultlocation",     // field sa UserLogin
+        foreignField: "_id",                 // field sa ActionBooking
+        as: "defaultLocationData",           // output array
+      },
+    },
+
+    // ✅ 3. Kunin ang unang item mula sa array (or null)
+    {
+      $unwind: {
+        path: "$defaultLocationData",
+        preserveNullAndEmptyArrays: true,   // ✅ keep user kahit walang match
+      },
+    },
+
+    // ✅ 4. Project — id + locationName lang
+    {
+      $project: {
+        _id: 0,
+        isdefaultlocation: {
+          $cond: {
+            if: { $ifNull: ["$defaultLocationData._id", null] },
+            then: {
+              id: "$defaultLocationData._id",
+              locationName: {
+                $ifNull: [
+                  "$defaultLocationData.accommodationName",
+                  {
+                    $ifNull: [
+                      "$defaultLocationData.bookingNumber",
+                      "Unknown Location",
+                    ],
+                  },
+                ],
+              },
+            },
+            else: null,   // ✅ null kapag walang default
+          },
+        },
+      },
+    },
+  ]);
+
+  console.log("🔍 [Getdefaultlocation] aggregation result:", result);
+
+  // ✅ Kung walang user
+  if (!result || result.length === 0) {
+    return next(new CustomError("User not found.", 404));
+  }
+
+  const displayData = result[0].isdefaultlocation;
+
+  console.log("✅ [Getdefaultlocation] Display data:", displayData);
+
+  // ✅ 5. Return success
+  res.status(200).json({
+    status: "success",
+    data: {
+      isdefaultlocation: displayData,
     },
   });
 });

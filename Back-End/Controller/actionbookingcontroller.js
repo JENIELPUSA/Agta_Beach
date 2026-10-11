@@ -1,22 +1,82 @@
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 const Notification = require("../Models/NotificationSchema");
 const UserLoginSchema = require("../Models/LogInDentalSchema");
+const Order = require("../Models/OrderSchema");
+const ActionBooking = require("../Models/ActionBooking");
+const Customer = require("../Models/CustomerSchema");
 const mongoose = require("mongoose");
-const BillingHistory = require('../Models/BillingHistorySchema')
-const Billing = require("../Models/BillingHistorySchema")
-const Order = require("../Models/OrderSchema")
-const ActionBooking = require("../Models/ActionBooking")
-const Customer = require("../Models/CustomerSchema")
 
+// =====================================
+// HELPER: Get unit price based on booking item model
+// =====================================
+const getItemUnitPrice = async (bookingItemId, bookingItemModel) => {
+  try {
+    let item = null;
+
+    switch (bookingItemModel) {
+      case "Accommodation": {
+        const Accommodation = mongoose.model("Accommodation");
+        item = await Accommodation.findById(bookingItemId)
+          .select("pricePerDay")
+          .lean();
+        return item?.pricePerDay || 0;
+      }
+      case "Rental": {
+        const Rental = mongoose.model("Rental");
+        item = await Rental.findById(bookingItemId).select("price").lean();
+        return item?.price || 0;
+      }
+      case "Service": {
+        const Service = mongoose.model("Service");
+        item = await Service.findById(bookingItemId).select("price").lean();
+        return item?.price || 0;
+      }
+      case "Activity": {
+        const Activity = mongoose.model("Activity");
+        item = await Activity.findById(bookingItemId).select("price").lean();
+        return item?.price || 0;
+      }
+      default:
+        return 0;
+    }
+  } catch (error) {
+    console.error("❌ [getItemUnitPrice] Error:", error);
+    return 0;
+  }
+};
+
+// =====================================
+// HELPER: Check if date is weekend
+// =====================================
+const isWeekendDate = (date) => {
+  const d = new Date(date);
+  const day = d.getDay(); // 0 = Sunday, 6 = Saturday
+  return day === 0 || day === 6;
+};
+
+// =====================================
+// HELPER: Compute total price
+// =====================================
+const computeTotalPrice = (unitPrice, expectedStay, bookingItemModel) => {
+  const stay = parseInt(expectedStay) || 1;
+
+  if (bookingItemModel === "Accommodation") {
+    return unitPrice * stay;
+  }
+
+  // Para sa Service / Activity / Rental — adjust ayon sa business logic
+  return unitPrice;
+};
+
+// =====================================
+// GET MY BILLING
+// =====================================
 exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   const userId = req.user?._id;
   const role = req.user?.role;
 
-  // =========================
-  // INITIAL MATCH CONDITIONS
-  // =========================
   const bookingMatch = {
-    status: "Confirmed", 
+    status: "Confirmed",
   };
 
   const orderMatch = {
@@ -27,13 +87,19 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   // =========================
   // ROLE-BASED FILTERING
   // =========================
-  const nonCustomerRoles = ["admin", "receptionist", "staff", "manager", "superadmin"];
+  const nonCustomerRoles = [
+    "admin",
+    "receptionist",
+    "staff",
+    "manager",
+    "superadmin",
+  ];
 
   if (role && nonCustomerRoles.includes(role)) {
-    console.log(`🔍 ${role} - Fetching ALL confirmed bookings and orders (no user filter)`);
-    // Don't add userId filter - fetch everything
+    console.log(
+      `🔍 ${role} - Fetching ALL confirmed bookings and orders (no user filter)`
+    );
   } else if (userId) {
-    // Customer - filter by userId
     bookingMatch.customerId = new mongoose.Types.ObjectId(userId);
     orderMatch.userId = new mongoose.Types.ObjectId(userId);
     console.log("🔍 Customer - Filtering by user ID:", userId);
@@ -57,35 +123,20 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  // =========================
-  // DEBUG - CHECK FINAL MATCH CONDITIONS
-  // =========================
   console.log("📋 Booking Match:", JSON.stringify(bookingMatch, null, 2));
   console.log("📋 Order Match:", JSON.stringify(orderMatch, null, 2));
-
-  if (bookingMatch.customerId) {
-    console.log("⚠️ WARNING: bookingMatch has customerId filter!");
-  } else {
-    console.log("✅ bookingMatch has NO customerId filter - fetching ALL confirmed bookings");
-  }
-
-  if (orderMatch.userId) {
-    console.log("⚠️ WARNING: orderMatch has userId filter!");
-  } else {
-    console.log("✅ orderMatch has NO userId filter - fetching ALL orders");
-  }
 
   // =========================
   // PRE-AGGREGATION CHECK (DEBUG)
   // =========================
-  console.log("🔍 PRE-AGGREGATION DATA CHECK:");
-
-  const rawBookingCount = await ActionBooking.countDocuments({ status: "Confirmed" });
+  const rawBookingCount = await ActionBooking.countDocuments({
+    status: "Confirmed",
+  });
   console.log(`📊 Confirmed bookings: ${rawBookingCount}`);
 
   const rawOrderCount = await Order.countDocuments({
     status: "completed",
-    "payment.status": { $ne: "paid" }
+    "payment.status": { $ne: "paid" },
   });
   console.log(`📊 Raw orders (completed & not paid): ${rawOrderCount}`);
 
@@ -138,7 +189,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     },
 
     // =========================
-    // LOOKUP CUSTOMER DETAILS - FIXED FOR NON-CUSTOMERS
+    // LOOKUP CUSTOMER DETAILS
     // =========================
     {
       $lookup: {
@@ -167,7 +218,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     },
     {
       $project: {
-        customerArray: 0, // Remove temporary field
+        customerArray: 0,
       },
     },
 
@@ -262,7 +313,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
           {
             $match: {
-              "matchingBooking": { $ne: null },
+              matchingBooking: { $ne: null },
             },
           },
           {
@@ -290,7 +341,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     },
 
     // =========================
-    // LOOKUP ALL BILLING (for checking fully paid)
+    // LOOKUP ALL BILLING
     // =========================
     {
       $lookup: {
@@ -340,7 +391,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
           {
             $match: {
-              "matchingBooking": { $ne: null },
+              matchingBooking: { $ne: null },
             },
           },
           {
@@ -363,7 +414,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     // =========================
     {
       $addFields: {
-        // Get the correct item based on bookingItemModel
         itemDetails: {
           $switch: {
             branches: [
@@ -388,7 +438,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
         },
 
-        // Get price based on item type
         itemPrice: {
           $switch: {
             branches: [
@@ -397,7 +446,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                 then: {
                   $cond: {
                     if: { $gt: [{ $size: "$accommodationItem" }, 0] },
-                    then: { $arrayElemAt: ["$accommodationItem.pricePerDay", 0] },
+                    then: {
+                      $arrayElemAt: ["$accommodationItem.pricePerDay", 0],
+                    },
                     else: 0,
                   },
                 },
@@ -437,7 +488,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
         },
 
-        // Item name
         itemName: {
           $switch: {
             branches: [
@@ -486,7 +536,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
         },
 
-        // Item description
         itemDescription: {
           $switch: {
             branches: [
@@ -495,7 +544,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                 then: {
                   $cond: {
                     if: { $gt: [{ $size: "$accommodationItem" }, 0] },
-                    then: { $arrayElemAt: ["$accommodationItem.description", 0] },
+                    then: {
+                      $arrayElemAt: ["$accommodationItem.description", 0],
+                    },
                     else: "",
                   },
                 },
@@ -535,7 +586,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
         },
 
-        // Item image
         itemImage: {
           $switch: {
             branches: [
@@ -584,14 +634,10 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
         },
 
-        // Customer name
         customerName: "$customer.name",
         customerEmail: "$customer.email",
-
-        // Approver name
         approverName: "$approver.name",
 
-        // Accommodation specific
         accommodationType: {
           $cond: {
             if: { $gt: [{ $size: "$accommodationItem" }, 0] },
@@ -620,8 +666,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
             else: [],
           },
         },
-
-        // Rental specific
         rentalUnit: {
           $cond: {
             if: { $gt: [{ $size: "$rentalItem" }, 0] },
@@ -629,8 +673,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
             else: null,
           },
         },
-
-        // Service specific
         serviceCategory: {
           $cond: {
             if: { $gt: [{ $size: "$serviceItem" }, 0] },
@@ -642,7 +684,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         bookingStatus: "$status",
         isCompleted: "$isDone",
 
-        // BILLING HISTORY FIELDS
         latestPartial: { $arrayElemAt: ["$partialBilling", 0] },
         hasPartial: { $gt: [{ $size: "$partialBilling" }, 0] },
 
@@ -690,30 +731,20 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
             else: null,
           },
         },
-
-        debugPartial: {
-          $cond: {
-            if: { $gt: [{ $size: "$partialBilling" }, 0] },
-            then: {
-              $concat: [
-                "Partial found: ",
-                { $toString: "$latestPartial.transactionId" },
-                " | Amount: ",
-                { $toString: "$latestPartial.matchingBooking.paymentAmount" },
-                " | Remaining: ",
-                { $toString: "$latestPartial.matchingBooking.remainingBalance" },
-              ],
-            },
-            else: "No partial payment found",
-          },
-        },
       },
     },
 
     // COMPUTE DISPLAY AMOUNT
     {
       $addFields: {
-        originalAmount: "$itemPrice",
+        //  Gamitin ang totalPrice kung mayroon, else itemPrice
+        originalAmount: {
+          $cond: {
+            if: { $gt: ["$totalPrice", 0] },
+            then: "$totalPrice",
+            else: "$itemPrice",
+          },
+        },
 
         displayAmount: {
           $cond: {
@@ -723,8 +754,25 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                 { $gt: ["$partialPaymentAmount", 0] },
               ],
             },
-            then: { $subtract: ["$itemPrice", "$partialPaymentAmount"] },
-            else: "$itemPrice",
+            then: {
+              $subtract: [
+                {
+                  $cond: {
+                    if: { $gt: ["$totalPrice", 0] },
+                    then: "$totalPrice",
+                    else: "$itemPrice",
+                  },
+                },
+                "$partialPaymentAmount",
+              ],
+            },
+            else: {
+              $cond: {
+                if: { $gt: ["$totalPrice", 0] },
+                then: "$totalPrice",
+                else: "$itemPrice",
+              },
+            },
           },
         },
 
@@ -760,7 +808,13 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           $cond: {
             if: { $eq: ["$hasPartial", true] },
             then: "$partialRemainingBalance",
-            else: "$itemPrice",
+            else: {
+              $cond: {
+                if: { $gt: ["$totalPrice", 0] },
+                then: "$totalPrice",
+                else: "$itemPrice",
+              },
+            },
           },
         },
 
@@ -788,6 +842,15 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         bookingStatus: 1,
         isCompleted: 1,
         createdAt: "$created_at",
+        checkIn: 1,
+        checkOut: 1,
+        expected_stay: 1,
+
+        //  BAGONG FIELDS
+        unitPrice: 1,
+        isWeekend: 1,
+        totalPrice: 1,
+
         customer: {
           _id: "$customer._id",
           name: "$customer.name",
@@ -824,7 +887,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         billingHistoryCount: 1,
         hasPartial: 1,
         hasFullyPaid: 1,
-        debugPartial: 1,
       },
     },
   ]);
@@ -839,7 +901,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   const orders = await Order.aggregate([
     { $match: orderMatch },
 
-    // LOOKUP USER DETAILS - FIXED FOR NON-CUSTOMERS
     {
       $lookup: {
         from: "userloginschemas",
@@ -871,7 +932,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
       },
     },
 
-    // LOOKUP PARTIAL PAYMENTS
     {
       $lookup: {
         from: "billinghistories",
@@ -928,7 +988,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
           {
             $match: {
-              "matchingBooking": { $ne: null },
+              matchingBooking: { $ne: null },
             },
           },
           {
@@ -955,7 +1015,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
       },
     },
 
-    // LOOKUP ALL BILLING
     {
       $lookup: {
         from: "billinghistories",
@@ -1002,7 +1061,7 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
           },
           {
             $match: {
-              "matchingBooking": { $ne: null },
+              matchingBooking: { $ne: null },
             },
           },
           {
@@ -1067,22 +1126,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
             else: null,
           },
         },
-        debugPartial: {
-          $cond: {
-            if: { $gt: [{ $size: "$partialBilling" }, 0] },
-            then: {
-              $concat: [
-                "Partial found: ",
-                { $toString: "$latestPartial.transactionId" },
-                " | Amount: ",
-                { $toString: "$latestPartial.matchingBooking.paymentAmount" },
-                " | Remaining: ",
-                { $toString: "$latestPartial.matchingBooking.remainingBalance" },
-              ],
-            },
-            else: "No partial payment found",
-          },
-        },
       },
     },
 
@@ -1097,7 +1140,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                 { $gt: ["$partialPaymentAmount", 0] },
               ],
             },
-            then: { $subtract: ["$totals.totalAmount", "$partialPaymentAmount"] },
+            then: {
+              $subtract: ["$totals.totalAmount", "$partialPaymentAmount"],
+            },
             else: "$totals.totalAmount",
           },
         },
@@ -1186,7 +1231,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         billingHistoryCount: 1,
         hasPartial: 1,
         hasFullyPaid: 1,
-        debugPartial: 1,
       },
     },
   ]);
@@ -1215,7 +1259,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     0
   );
 
-  // Count by status
   const bookingStatusCounts = bookings.reduce((acc, item) => {
     const status = item.paymentStatusText || item.status || "Unknown";
     acc[status] = (acc[status] || 0) + 1;
@@ -1228,9 +1271,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     return acc;
   }, {});
 
-  // =========================
-  // RESPONSE
-  // =========================
   res.status(200).json({
     success: true,
     summary: {
@@ -1249,6 +1289,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   });
 });
 
+// =====================================
+// GET ALL BOOKINGS
+// =====================================
 exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   const { dateFrom, dateTo, page = 1, limit = 10, search } = req.query;
 
@@ -1262,7 +1305,6 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   // =========================
   let filter = {};
 
-  // DATE FILTER
   if (dateFrom || dateTo) {
     filter.created_at = {};
     if (dateFrom) filter.created_at.$gte = new Date(dateFrom);
@@ -1276,7 +1318,7 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   // SEARCH FILTER
   if (search && search.trim() !== "") {
     filter.$or = [
-      { bookingReference: { $regex: search, $options: "i" } },
+      { bookingNumber: { $regex: search, $options: "i" } },
       { status: { $regex: search, $options: "i" } },
       { bookingItemModel: { $regex: search, $options: "i" } },
     ];
@@ -1430,9 +1472,8 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
       $lookup: {
         from: "billinghistories",
         let: {
-          bookingRef: "$bookingReference",
-          orderNumber: "$orderNumber",
-          bookingId: "$_id"
+          bookingRef: "$bookingNumber",
+          bookingId: "$_id",
         },
         pipeline: [
           {
@@ -1440,15 +1481,11 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
               $expr: {
                 $or: [
                   { $eq: ["$bookings.bookingNumber", "$$bookingRef"] },
-                  { $eq: ["$bookings.orderNumber", "$$orderNumber"] },
-                  { $eq: ["$bookings.bookingNumber", "$$orderNumber"] },
-                  { $eq: ["$bookings.orderNumber", "$$bookingRef"] },
                   { $eq: ["$bookings._id", "$$bookingId"] },
                   { $in: ["$$bookingRef", "$bookings.bookingNumber"] },
-                  { $in: ["$$orderNumber", "$bookings.orderNumber"] },
-                ]
-              }
-            }
+                ],
+              },
+            },
           },
           {
             $addFields: {
@@ -1461,26 +1498,23 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
                       cond: {
                         $or: [
                           { $eq: ["$$b.bookingNumber", "$$bookingRef"] },
-                          { $eq: ["$$b.orderNumber", "$$orderNumber"] },
-                          { $eq: ["$$b.bookingNumber", "$$orderNumber"] },
-                          { $eq: ["$$b.orderNumber", "$$bookingRef"] },
                           { $eq: ["$$b._id", "$$bookingId"] },
-                        ]
-                      }
-                    }
+                        ],
+                      },
+                    },
                   },
-                  0
-                ]
-              }
-            }
+                  0,
+                ],
+              },
+            },
           },
           {
             $match: {
-              "matchingBooking": { $ne: null }
-            }
+              matchingBooking: { $ne: null },
+            },
           },
           {
-            $sort: { createdAt: -1 }
+            $sort: { createdAt: -1 },
           },
           {
             $project: {
@@ -1493,11 +1527,11 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
               "matchingBooking.remainingBalance": 1,
               createdAt: 1,
               updatedAt: 1,
-            }
-          }
+            },
+          },
         ],
         as: "billingHistory",
-      }
+      },
     },
 
     // =========================
@@ -1507,11 +1541,8 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
       $addFields: {
         latestBilling: { $arrayElemAt: ["$billingHistory", 0] },
         allBilling: "$billingHistory",
-
-        // Check if booking has billing history
         hasBilling: { $gt: [{ $size: "$billingHistory" }, 0] },
 
-        // Get payment status from latest billing
         paymentStatus: {
           $cond: {
             if: { $gt: [{ $size: "$billingHistory" }, 0] },
@@ -1520,50 +1551,50 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
                 branches: [
                   {
                     case: { $eq: ["$latestBilling.status", "fully_paid"] },
-                    then: "fully_paid"
+                    then: "fully_paid",
                   },
                   {
                     case: { $eq: ["$latestBilling.status", "partial"] },
-                    then: "partial"
+                    then: "partial",
                   },
                   {
                     case: {
                       $and: [
-                        { $eq: ["$latestBilling.paymentDetails.paymentType", "full"] },
-                        { $eq: ["$latestBilling.status", "completed"] }
-                      ]
+                        {
+                          $eq: [
+                            "$latestBilling.paymentDetails.paymentType",
+                            "full",
+                          ],
+                        },
+                        { $eq: ["$latestBilling.status", "completed"] },
+                      ],
                     },
-                    then: "fully_paid"
-                  }
+                    then: "fully_paid",
+                  },
                 ],
-                default: "unpaid"
-              }
+                default: "unpaid",
+              },
             },
-            else: "unpaid"
-          }
+            else: "unpaid",
+          },
         },
 
-        // Get total paid amount from all billings
         totalPaidAmount: {
           $cond: {
             if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: {
-              $sum: "$billingHistory.paymentDetails.paymentAmount"
-            },
-            else: 0
-          }
+            then: { $sum: "$billingHistory.paymentDetails.paymentAmount" },
+            else: 0,
+          },
         },
 
-        // Get the payment amount from the matching booking
         bookingPaymentAmount: {
           $cond: {
             if: { $gt: [{ $size: "$billingHistory" }, 0] },
             then: "$latestBilling.matchingBooking.paymentAmount",
-            else: 0
-          }
+            else: 0,
+          },
         },
 
-        // Get remaining balance
         remainingBalance: {
           $cond: {
             if: { $gt: [{ $size: "$billingHistory" }, 0] },
@@ -1571,14 +1602,13 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
               $cond: {
                 if: { $eq: ["$latestBilling.status", "partial"] },
                 then: "$latestBilling.matchingBooking.remainingBalance",
-                else: 0
-              }
+                else: 0,
+              },
             },
-            else: null
-          }
+            else: null,
+          },
         },
 
-        // Check if fully paid
         isFullyPaid: {
           $cond: {
             if: { $gt: [{ $size: "$billingHistory" }, 0] },
@@ -1586,13 +1616,13 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
               $or: [
                 { $eq: ["$latestBilling.status", "fully_paid"] },
                 { $eq: ["$latestBilling.status", "completed"] },
-                { $eq: ["$latestBilling.paymentDetails.paymentType", "full"] }
-              ]
+                { $eq: ["$latestBilling.paymentDetails.paymentType", "full"] },
+              ],
             },
-            else: false
-          }
-        }
-      }
+            else: false,
+          },
+        },
+      },
     },
 
     // =========================
@@ -1600,70 +1630,97 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
     // =========================
     {
       $addFields: {
-        originalAmount: "$amount",
+        //  Gamitin ang totalPrice kung mayroon
+        originalAmount: {
+          $cond: {
+            if: { $gt: ["$totalPrice", 0] },
+            then: "$totalPrice",
+            else: "$amount",
+          },
+        },
 
-        // Deduct paid amount from original amount for partial payments
         adjustedAmount: {
           $cond: {
             if: {
               $and: [
                 { $eq: ["$paymentStatus", "partial"] },
-                { $gt: ["$bookingPaymentAmount", 0] }
-              ]
+                { $gt: ["$bookingPaymentAmount", 0] },
+              ],
             },
-            then: { $subtract: ["$amount", "$bookingPaymentAmount"] },
-            else: "$amount"
-          }
+            then: {
+              $subtract: [
+                {
+                  $cond: {
+                    if: { $gt: ["$totalPrice", 0] },
+                    then: "$totalPrice",
+                    else: "$amount",
+                  },
+                },
+                "$bookingPaymentAmount",
+              ],
+            },
+            else: {
+              $cond: {
+                if: { $gt: ["$totalPrice", 0] },
+                then: "$totalPrice",
+                else: "$amount",
+              },
+            },
+          },
         },
 
-        // Display amount based on payment status
         displayAmount: {
           $switch: {
             branches: [
               {
                 case: { $eq: ["$paymentStatus", "fully_paid"] },
-                then: 0 // Fully paid - no amount due
+                then: 0,
               },
               {
                 case: { $eq: ["$paymentStatus", "partial"] },
-                then: { $subtract: ["$amount", "$bookingPaymentAmount"] } // Remaining balance
-              }
+                then: {
+                  $subtract: [
+                    {
+                      $cond: {
+                        if: { $gt: ["$totalPrice", 0] },
+                        then: "$totalPrice",
+                        else: "$amount",
+                      },
+                    },
+                    "$bookingPaymentAmount",
+                  ],
+                },
+              },
             ],
-            default: "$amount" // Unpaid - full amount
-          }
+            default: {
+              $cond: {
+                if: { $gt: ["$totalPrice", 0] },
+                then: "$totalPrice",
+                else: "$amount",
+              },
+            },
+          },
         },
 
-        // Payment status display text
         paymentStatusText: {
           $switch: {
             branches: [
               {
                 case: { $eq: ["$paymentStatus", "fully_paid"] },
-                then: "Fully Paid"
+                then: "Fully Paid",
               },
               {
                 case: { $eq: ["$paymentStatus", "partial"] },
-                then: "Partially Paid"
-              }
+                then: "Partially Paid",
+              },
             ],
-            default: "Unpaid"
-          }
+            default: "Unpaid",
+          },
         },
 
-        // Payment history count
-        paymentCount: { $size: "$billingHistory" }
-      }
+        paymentCount: { $size: "$billingHistory" },
+      },
     },
-
-    // =========================
-    // 6. FILTER OUT FULLY PAID (Optional)
-    // =========================
-    // Uncomment this to hide fully paid bookings
-    // {
-    //   $match: {
-    //     isFullyPaid: { $ne: true }
-    //   }
-    // },
 
     // =========================
     // 7. CLEANUP
@@ -1696,9 +1753,6 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   const bookings = results[0].data;
   const totalPages = Math.ceil(totalCount / pageSize);
 
-  // =========================
-  // RESPONSE
-  // =========================
   res.status(200).json({
     success: true,
     totalCount,
@@ -1709,6 +1763,9 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   });
 });
 
+// =====================================
+// CREATE BOOKING
+// =====================================
 exports.createBooking = AsyncErrorHandler(async (req, res) => {
   try {
     const {
@@ -1719,44 +1776,45 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
       middle_name,
       suffix,
       expected_stay,
-      userId
+      checkIn,
+      checkOut,
+      userId,
     } = req.body;
     const role = req.user.role;
 
     console.log("role", role);
     console.log("CREATE BOOKING REQUEST BODY:", req.body);
+    console.log("📍 checkIn:", checkIn);
+    console.log("📍 checkOut:", checkOut);
 
     let guestUserId = null;
     let customerId = null;
     let isWalkin = false;
-    let shouldCreateUser = true; // Flag to determine if we should create a user account
+    let shouldCreateUser = true;
 
     // =====================================
     // 1. CHECK IF USER IS RECEPTIONIST OR ADMIN
     // =====================================
     if (role === "receptionist" || role === "admin") {
-
-      // Set isWalkin to true for staff-created bookings
       isWalkin = true;
 
-      // Check if we should create a user account
-      // For Rentals and Services, we don't create user accounts
       if (bookingItemModel === "Rental" || bookingItemModel === "Service") {
         shouldCreateUser = false;
-        console.log(`ℹ️ ${bookingItemModel} booking - will create customer only, no user account`);
+        console.log(
+          `ℹ️ ${bookingItemModel} booking - will create customer only, no user account`
+        );
       }
 
-      // Check if userId is provided (existing user selected from table)
       if (userId) {
-        // Find existing user by userId
         const existingUser = await UserLoginSchema.findById(userId);
 
         if (existingUser) {
-          console.log(`👤 Using existing user account: ${existingUser.username}`);
+          console.log(
+            `👤 Using existing user account: ${existingUser.username}`
+          );
           guestUserId = existingUser._id;
-          customerId = existingUser.linkedId; // Get the linked customer ID
+          customerId = existingUser.linkedId;
 
-          // Update customer info if provided (optional)
           if (first_name || last_name || middle_name || suffix) {
             await Customer.findByIdAndUpdate(customerId, {
               first_name: first_name || existingUser.customer?.first_name,
@@ -1768,12 +1826,10 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         } else {
           return res.status(404).json({
             success: false,
-            message: "User not found with the provided userId"
+            message: "User not found with the provided userId",
           });
         }
       } else {
-        // No userId provided - create new customer
-        // Step 1: Create Customer first
         const customer = await Customer.create({
           first_name: first_name || "",
           last_name: last_name || "",
@@ -1781,72 +1837,68 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
           suffix: suffix || "",
           avatar: {
             url: "",
-            public_id: ""
-          }
+            public_id: "",
+          },
         });
 
         customerId = customer._id;
-        console.log(`✅ Created customer: ${first_name} ${last_name}`);
+        console.log(` Created customer: ${first_name} ${last_name}`);
 
-        // Step 2: Create user account ONLY for Accommodation bookings
         if (shouldCreateUser) {
-          // Check if user account already exists for this customer
-          const existingUser = await UserLoginSchema.findOne({ linkedId: customerId });
+          const existingUser = await UserLoginSchema.findOne({
+            linkedId: customerId,
+          });
 
           if (!existingUser) {
-            // Generate username: firstname + "guestagta" + "@gmail.com"
             const guestFirstName = first_name || "guest";
             const username = `${guestFirstName.toLowerCase()}guestagta@gmail.com`;
             const password = "default123";
 
-            // Create user login account linked to the customer
             const newUser = await UserLoginSchema.create({
               username: username,
-              password: password, // Make sure to hash this if using bcrypt
-              role: "customer", // Always set role as customer for guests
+              password: password,
+              role: "customer",
               linkedId: customerId,
-              isVerified: true, // Auto-verified for staff-created accounts
+              isVerified: true,
             });
 
             guestUserId = newUser._id;
-            console.log(`✅ Created user account for guest: ${username}`);
-            console.log(`🔑 Default password: ${password}`);
+            console.log(` Created user account for guest: ${username}`);
           } else {
-            console.log(`👤 Guest already has user account: ${existingUser.username}`);
+            console.log(
+              `👤 Guest already has user account: ${existingUser.username}`
+            );
             guestUserId = existingUser._id;
           }
         } else {
-          // For Rentals and Services, we don't create a user account
-          // We'll use the customer ID directly or create a placeholder user
-          console.log(`ℹ️ No user account created for ${bookingItemModel} booking`);
-          
-          // Let's create a minimal user account without login credentials
-          // This allows the booking to be linked properly without creating a full user account
+          console.log(
+            `ℹ️ No user account created for ${bookingItemModel} booking`
+          );
+
           const tempUser = await UserLoginSchema.create({
-            username: `${first_name?.toLowerCase() || 'guest'}_temp_${Date.now()}`,
-            password: "temporary", // This will be hashed
+            username: `${first_name?.toLowerCase() || "guest"}_temp_${Date.now()}`,
+            password: "temporary",
             role: "customer",
             linkedId: customerId,
             isVerified: false,
-            isTemporary: true // Add this field to your schema or use a flag
+            isTemporary: true,
           });
-          
+
           guestUserId = tempUser._id;
-          console.log(`✅ Created temporary user account for ${bookingItemModel} booking`);
+          console.log(
+            ` Created temporary user account for ${bookingItemModel} booking`
+          );
         }
       }
-
     } else {
-      // For customers creating their own booking, use provided userId
       customerId = req.body.userId || req.body.customerId;
-      isWalkin = false; // Not a walk-in for customer-created bookings
+      isWalkin = false;
 
-      // Check if user exists
       const user = await UserLoginSchema.findById(customerId);
       if (!user) {
         return res.status(404).json({
           success: false,
-          message: "User not found"
+          message: "User not found",
         });
       }
       guestUserId = customerId;
@@ -1855,30 +1907,75 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     // =====================================
     // 2. DETERMINE BOOKING STATUS
     // =====================================
-    // If isWalkin is true, set status to "Confirmed"
-    // Otherwise, set to "Pending" for regular bookings
     const bookingStatus = isWalkin ? "Confirmed" : "Pending";
-    console.log(`📌 Booking status set to: ${bookingStatus} (isWalkin: ${isWalkin})`);
+    console.log(
+      `📌 Booking status set to: ${bookingStatus} (isWalkin: ${isWalkin})`
+    );
 
     // =====================================
-    // 3. CREATE BOOKING with isWalkin, expected_stay, and status
+    // 3. COMPUTE CHECK-IN / CHECK-OUT
+    // =====================================
+    const finalCheckIn = checkIn ? new Date(checkIn) : new Date();
+
+    let finalCheckOut = checkOut ? new Date(checkOut) : null;
+    if (!finalCheckOut && finalCheckIn && expected_stay) {
+      finalCheckOut = new Date(finalCheckIn);
+      finalCheckOut.setDate(
+        finalCheckOut.getDate() + parseInt(expected_stay)
+      );
+    }
+
+    console.log("📍 Final checkIn:", finalCheckIn);
+    console.log("📍 Final checkOut:", finalCheckOut);
+
+    // =====================================
+    // 3.5 COMPUTE UNIT PRICE, ISWEEKEND, TOTAL PRICE
+    // =====================================
+    const unitPrice = await getItemUnitPrice(
+      bookingItemId,
+      bookingItemModel
+    );
+    const isWeekend = isWeekendDate(finalCheckIn);
+    const totalPrice = computeTotalPrice(
+      unitPrice,
+      expected_stay,
+      bookingItemModel
+    );
+
+    console.log("💰 unitPrice:", unitPrice);
+    console.log("💰 isWeekend:", isWeekend);
+    console.log("💰 totalPrice:", totalPrice);
+
+    // =====================================
+    // 4. CREATE BOOKING
     // =====================================
     const booking = await ActionBooking.create({
-      customerId: guestUserId, // Use the user ID
+      customerId: guestUserId,
       bookingItemId,
       bookingItemModel,
       isWalkin: isWalkin,
-      expected_stay: expected_stay || 1, // Default to 1 day if not provided
-      status: bookingStatus // Set the status based on isWalkin
+      expected_stay: expected_stay || 1,
+      checkIn: finalCheckIn,
+      checkOut: finalCheckOut,
+      status: bookingStatus,
+
+      //  BAGONG FIELDS
+      unitPrice: req.body.unitPrice,
+      isWeekend: req.body.isWeekend,
+      totalPrice: req.body.totalPrice,
+      weekdaysPrice: req.body.weekdaysPrice,
+      isWeekend: req.body.isWeekend,
+      weekendPrice: req.body.weekendPrice,
+      weekdaysBreakfastPrice: req.body.weekdaysBreakfastPrice,
+      weekendBreakfastPrice: req.body.weekendBreakfastPrice
     });
 
     // =====================================
-    // 4. AGGREGATION (FULL DETAILS)
+    // 5. AGGREGATION (FULL DETAILS)
     // =====================================
     const detailedBookingArray = await ActionBooking.aggregate([
       { $match: { _id: booking._id } },
 
-      // CUSTOMER USER
       {
         $lookup: {
           from: "userloginschemas",
@@ -2026,42 +2123,44 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     const finalBookingData = detailedBookingArray[0];
 
     // =====================================
-    // 5. SOCKET EMIT (BOOKING)
+    // 6. SOCKET EMIT (BOOKING)
     // =====================================
     const io = req.app.get("socketio");
 
     if (io) {
       const payload = {
         booking: finalBookingData,
-        message: `New ${isWalkin ? 'walk-in ' : ''}booking created (${bookingStatus})`,
+        message: `New ${isWalkin ? "walk-in " : ""}booking created (${bookingStatus})`,
       };
 
       io.to("admin").emit("newBooking", payload);
       io.to("receptionist").emit("newBooking", payload);
 
-      console.log(`📡 BOOKING EMITTED TO ADMIN + RECEPTIONIST (Status: ${bookingStatus})`);
+      console.log(
+        `📡 BOOKING EMITTED TO ADMIN + RECEPTIONIST (Status: ${bookingStatus})`
+      );
     }
 
     const staffMembers = await UserLoginSchema.find({
-      role: { $in: ["admin", "receptionist"] }
+      role: { $in: ["admin", "receptionist"] },
     }).select("_id");
 
     // =====================================
-    // 6. CREATE NOTIFICATION
+    // 7. CREATE NOTIFICATION
     // =====================================
-    const viewersList = staffMembers.map(staff => ({
+    const viewersList = staffMembers.map((staff) => ({
       user: staff._id,
-      isRead: false
+      isRead: false,
     }));
 
     const newNotification = await Notification.create({
-      message: `New ${isWalkin ? 'walk-in ' : ''}booking created for ${bookingItemModel} (${bookingStatus}) - ${expected_stay || 1} day${expected_stay > 1 ? 's' : ''}`,
+      message: `New ${isWalkin ? "walk-in " : ""}booking created for ${bookingItemModel} (${bookingStatus}) - ${expected_stay || 1} day${expected_stay > 1 ? "s" : ""}`,
       FileId: finalBookingData?._id,
       viewers: viewersList,
     });
 
     // =====================================
-    // 7. SOCKET EMIT (NOTIFICATION ONLY ADMIN + RECEPTIONIST)
+    // 8. SOCKET EMIT (NOTIFICATION)
     // =====================================
     if (io) {
       const notifPayload = {
@@ -2079,22 +2178,21 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     }
 
     // =====================================
-    // 8. RESPONSE
+    // 9. RESPONSE
     // =====================================
     const responseData = {
       success: true,
       message: "Booking created successfully",
       data: finalBookingData,
-      status: bookingStatus, // Include status in response
+      status: bookingStatus,
     };
 
-    // Include customer and user creation info for staff
     if (role === "receptionist" || role === "admin") {
       if (userId) {
         responseData.userInfo = {
           userId: userId,
           message: "Used existing user account",
-          isExistingUser: true
+          isExistingUser: true,
         };
       } else {
         responseData.customerInfo = {
@@ -2102,20 +2200,26 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
           name: `${first_name} ${last_name}`,
           bookingType: bookingItemModel,
           hasUserAccount: shouldCreateUser,
-          username: shouldCreateUser ? `${first_name?.toLowerCase() || 'guest'}guestagta@gmail.com` : null,
+          username: shouldCreateUser
+            ? `${first_name?.toLowerCase() || "guest"}guestagta@gmail.com`
+            : null,
           password: shouldCreateUser ? "default123" : null,
           isWalkin: true,
           expected_stay: expected_stay || 1,
+          checkIn: finalCheckIn,
+          checkOut: finalCheckOut,
           status: bookingStatus,
-          message: shouldCreateUser ? 
-            "Customer and user account created" : 
-            "Customer created (no user account for rentals/services)"
+          unitPrice: unitPrice,
+          isWeekend: isWeekend,
+          totalPrice: totalPrice,
+          message: shouldCreateUser
+            ? "Customer and user account created"
+            : "Customer created (no user account for rentals/services)",
         };
       }
     }
 
     res.status(201).json(responseData);
-
   } catch (error) {
     console.error("CREATE BOOKING ERROR:", error);
 
@@ -2127,9 +2231,12 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
   }
 });
 
+// =====================================
+// GET SINGLE BOOKING
+// =====================================
 exports.getSingleBooking = AsyncErrorHandler(async (req, res) => {
   const booking = await ActionBooking.findById(req.params.id)
-    .populate("custromerId")
+    .populate("customerId")
     .populate("approverId");
 
   if (!booking) {
@@ -2145,9 +2252,12 @@ exports.getSingleBooking = AsyncErrorHandler(async (req, res) => {
   });
 });
 
+// =====================================
+// UPDATE BOOKING STATUS
+// =====================================
 exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
   try {
-    const { status, approverId } = req.body;
+    const { status, approverId, checkIn, checkOut, expected_stay } = req.body;
 
     let booking = await ActionBooking.findById(req.params.id);
 
@@ -2162,11 +2272,26 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
     // BUILD UPDATE OBJECT (IGNORE EMPTY VALUES)
     // =========================
     const updateData = Object.fromEntries(
-      Object.entries({ status, approverId })
-        .filter(([_, value]) => value !== undefined && value !== null && value !== "")
+      Object.entries({
+        status,
+        approverId,
+        checkIn,
+        checkOut,
+        expected_stay,
+      }).filter(
+        ([_, value]) => value !== undefined && value !== null && value !== ""
+      )
     );
 
-    // OPTIONAL: prevent empty update
+    // Auto-compute checkOut kung may checkIn at expected_stay pero walang checkOut
+    if (updateData.checkIn && updateData.expected_stay && !updateData.checkOut) {
+      const checkInDate = new Date(updateData.checkIn);
+      checkInDate.setDate(
+        checkInDate.getDate() + parseInt(updateData.expected_stay)
+      );
+      updateData.checkOut = checkInDate;
+    }
+
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({
         success: false,
@@ -2174,14 +2299,53 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
       });
     }
 
+    console.log("📝 Update data:", updateData);
+
     // =========================
-    // UPDATE BOOKING
+    // RECOMPUTE PRICE KUNG MAY CHANGES SA STAY O CHECK-IN
     // =========================
-    booking = await ActionBooking.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true }
-    );
+    if (
+      updateData.expected_stay !== undefined ||
+      updateData.checkIn !== undefined
+    ) {
+      const newCheckIn = updateData.checkIn || booking.checkIn;
+      const newExpectedStay =
+        updateData.expected_stay !== undefined
+          ? updateData.expected_stay
+          : booking.expected_stay;
+
+      const unitPrice = await getItemUnitPrice(
+        booking.bookingItemId,
+        booking.bookingItemModel
+      );
+      const isWeekend = isWeekendDate(newCheckIn);
+      const totalPrice = computeTotalPrice(
+        unitPrice,
+        newExpectedStay,
+        booking.bookingItemModel
+      );
+
+      updateData.unitPrice = unitPrice;
+      updateData.isWeekend = isWeekend;
+      updateData.totalPrice = totalPrice;
+
+      console.log(
+        "💰 Recomputed — unitPrice:",
+        unitPrice,
+        "| isWeekend:",
+        isWeekend,
+        "| totalPrice:",
+        totalPrice
+      );
+    }
+
+    // =========================
+    // APPLY UPDATE TO DOCUMENT
+    // =========================
+    Object.assign(booking, updateData);
+
+    // Ito ang magti-trigger ng pre-save at post-save middleware
+    await booking.save();
 
     // =========================
     // ENRICHED BOOKING (LOOKUP)
@@ -2189,7 +2353,6 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
     const detailedBookingArray = await ActionBooking.aggregate([
       { $match: { _id: booking._id } },
 
-      // CUSTOMER USER
       {
         $lookup: {
           from: "userloginschemas",
@@ -2348,9 +2511,6 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
 
     const customerRoom = `user-${booking.customerId}`;
 
-    // =========================
-    // SOCKET EMIT
-    // =========================
     if (io) {
       io.to("admin").emit("booking-status-updated", payload);
       io.to("receptionist").emit("booking-status-updated", payload);
@@ -2359,9 +2519,6 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
       console.log("📡 STATUS EMITTED TO ROOMS");
     }
 
-    // =========================
-    // NOTIFICATION (ONLY IF STATUS CHANGED)
-    // =========================
     if (updateData.status) {
       const notification = await Notification.create({
         message: `Your booking status has been updated to ${updateData.status}`,
@@ -2388,14 +2545,10 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
       }
     }
 
-    // =========================
-    // RESPONSE
-    // =========================
     res.status(200).json({
       success: true,
       data: finalBooking,
     });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({
@@ -2405,6 +2558,9 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
   }
 });
 
+// =====================================
+// DELETE BOOKING
+// =====================================
 exports.deleteBooking = AsyncErrorHandler(async (req, res) => {
   const booking = await ActionBooking.findById(req.params.id);
 
@@ -2422,3 +2578,96 @@ exports.deleteBooking = AsyncErrorHandler(async (req, res) => {
     message: "Booking deleted successfully",
   });
 });
+
+// =====================================
+// GET MY ACCOMMODATION
+// =====================================
+exports.getMyAccomodation = AsyncErrorHandler(async (req, res, next) => {
+  const linkId = req.user?.linkId;
+  const role = req.user?.role;
+  const matchStage = {
+    bookingItemModel: "Accommodation",
+    status: "CheckIn",
+  };
+
+  if (role === "customer") {
+    if (!linkId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing linkId in user token",
+      });
+    }
+
+    const userLogin = await UserLoginSchema.findOne({
+      linkedId: new mongoose.Types.ObjectId(linkId),
+    })
+      .select("_id")
+      .lean();
+
+    if (!userLogin) {
+      return res.status(404).json({
+        success: false,
+        message: "No UserLoginSchema found for this linkedId",
+        linkId,
+      });
+    }
+
+    matchStage.customerId = userLogin._id;
+  }
+
+  console.log("MATCH STAGE:", JSON.stringify(matchStage));
+
+  const accommodationCollection =
+    mongoose.model("Accommodation").collection.name;
+
+  const bookings = await ActionBooking.aggregate([
+    { $match: matchStage },
+
+    {
+      $lookup: {
+        from: accommodationCollection,
+        localField: "bookingItemId",
+        foreignField: "_id",
+        as: "accommodation",
+      },
+    },
+    {
+      $unwind: {
+        path: "$accommodation",
+        preserveNullAndEmptyArrays: true,
+      },
+    },
+
+    {
+      $project: {
+        _id: 1,
+        bookingNumber: 1,
+        status: 1,
+        setdefault: 1,
+        checkIn: 1,
+        checkOut: 1,
+        expected_stay: 1,
+
+        //  BAGONG FIELDS
+        unitPrice: 1,
+        isWeekend: 1,
+        totalPrice: 1,
+
+        accommodationName: { $ifNull: ["$accommodation.name", "N/A"] },
+      },
+    },
+
+    { $sort: { created_at: -1 } },
+  ]);
+
+  console.log("RESULT COUNT:", bookings);
+
+  res.status(200).json({
+    success: true,
+    count: bookings.length,
+    role,
+    data: bookings,
+  });
+});
+
+module.exports = exports;

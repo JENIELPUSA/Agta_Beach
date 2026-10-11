@@ -13,7 +13,7 @@ const sendEmail = async (options) => {
     });
 
     const mailOptions = {
-        from: `Government File Archiving System <${process.env.EMAIL_USER}>`,
+        from: `Agta Beach Resort <${process.env.EMAIL_USER}>`,
         to: options.email,
         subject: options.subject,
         html: `
@@ -174,9 +174,9 @@ const sendEmail = async (options) => {
         <body>
             <div class="container">
                 <div class="header">
-                    <div class="archive-icon">🏛️</div>
-                    <h1 class="agency-name">Government File Archives System</h1>
-                    <p class="system-name">Document Archiving and Management System</p>
+                    <div class="archive-icon">🏖️</div>
+                    <h1 class="agency-name">Agta Beach Resort</h1>
+                    <p class="system-name">Reservation and Booking Management System</p>
                 </div>
                 
                 <div class="content">
@@ -186,17 +186,17 @@ const sendEmail = async (options) => {
                     </div>
                     
                     <div class="info-card">
-                        <span class="info-label">Document Reference</span>
+                        <span class="info-label">Booking Reference</span>
                         <span class="info-value">${options.subject}</span>
                     </div>
                     
                     <p class="message">
-                        This is an automated notification regarding your document submission or request.
+                        This is an automated notification regarding your reservation or booking request.
                         For inquiries, please contact our support during office hours.
                     </p>
                     
                     <div class="action-container">
-                        <a href="https://bp-sangguniangpanlalawigan.com" class="action-btn">Access Archive Portal</a>
+                        <a href="https://agtabeachresort.com" class="action-btn">Visit Agta Beach Resort</a>
                     </div>
                     
                     <div class="contact-info">
@@ -205,7 +205,7 @@ const sendEmail = async (options) => {
                 </div>
                 
                 <div class="footer">
-                    <span class="auto-msg">© ${new Date().getFullYear()} Government File Archiving Management System. All rights reserved.</span>
+                    <span class="auto-msg">© ${new Date().getFullYear()} Agta Beach Resort. All rights reserved.</span>
                 </div>
             </div>
         </body>

@@ -12,13 +12,18 @@ const UserLoginSchema = new mongoose.Schema({
   first_name: { type: String },
   last_name: { type: String },
   contact_number: { type: Number },
-  username: { type: String},
+  username: { type: String },
   password: { type: String, required: true },
   role: {
     type: String,
-    enum: ["admin", "user", "receptionist", "customer"],
+    enum: ["admin", "user", "receptionist", "customer","staff"],
     required: true,
     lowercase: true,
+  },
+
+  isdefaultlocation: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Accommodation",
   },
 
   isVerified: { type: Boolean, default: false },

@@ -1,10 +1,13 @@
 const mongoose = require("mongoose");
+
 const rentalSchema = new mongoose.Schema(
   {
-    avatar: {
-      url: String,
-      public_id: String,
-    },
+    avatar: [
+      {
+        url: String,
+        public_id: String,
+      },
+    ],
     name: String, // Small Boat
 
     price: Number,

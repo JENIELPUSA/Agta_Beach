@@ -71,23 +71,80 @@ exports.deleteAdmin = AsyncErrorHandler(async (req, res, next) => {
   }
 });
 
-exports.DisplayAdmin = async (req, res) => {
-  try {
-    const adminResults = await Admin.aggregate([
-      {
-        $lookup: {
-          from: "userloginschemas", // ⚠️ check actual collection name
-          localField: "_id",
-          foreignField: "linkedId",
-          as: "loginInfo",
-        },
+exports.DisplayAdmin = AsyncErrorHandler(async (req, res) => {
+  const {
+    search = "",
+    page = 1,
+    limit = 10,
+    role,
+    gender,
+    isVerified,
+    sortBy = "created_at",
+    sortOrder = "desc",
+  } = req.query;
+
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+  const skip = (pageNum - 1) * limitNum;
+
+  // ─── Build $match (Admin fields) ────────────────────────────────
+  const matchStage = {};
+
+  if (search.trim()) {
+    const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    matchStage.$or = [
+      { first_name: { $regex: escaped, $options: "i" } },
+      { last_name: { $regex: escaped, $options: "i" } },
+      { middle_name: { $regex: escaped, $options: "i" } },
+      { email: { $regex: escaped, $options: "i" } },
+      { contact_number: { $regex: escaped, $options: "i" } },
+    ];
+  }
+
+  if (gender) matchStage.gender = gender;
+
+  // ─── Build $sort ────────────────────────────────────────────────
+  const allowedSortFields = ["created_at", "first_name", "last_name", "email"];
+  const sortField = allowedSortFields.includes(sortBy) ? sortBy : "created_at";
+  const sortDir = sortOrder === "asc" ? 1 : -1;
+
+  // ─── Shared pipeline (pre-pagination) ───────────────────────────
+  const basePipeline = [
+    { $match: matchStage },
+    {
+      $lookup: {
+        from: "userloginschemas",
+        localField: "_id",
+        foreignField: "linkedId",
+        as: "loginInfo",
       },
-      {
-        $unwind: {
-          path: "$loginInfo",
-          preserveNullAndEmptyArrays: true,
-        },
+    },
+    {
+      $unwind: {
+        path: "$loginInfo",
+        preserveNullAndEmptyArrays: true,
       },
+    },
+  ];
+
+  // Post-lookup filters
+  const postLookupMatch = {};
+  if (role) postLookupMatch["loginInfo.role"] = role;
+  if (isVerified !== undefined && isVerified !== "") {
+    postLookupMatch["loginInfo.isVerified"] = isVerified === "true";
+  }
+  if (Object.keys(postLookupMatch).length > 0) {
+    basePipeline.push({ $match: postLookupMatch });
+  }
+
+  // ─── Execute in parallel ────────────────────────────────────────
+  const [dataResult, countResult] = await Promise.all([
+    // Data pipeline
+    Admin.aggregate([
+      ...basePipeline,
+      { $sort: { [sortField]: sortDir } },
+      { $skip: skip },
+      { $limit: limitNum },
       {
         $project: {
           avatar: 1,
@@ -98,26 +155,33 @@ exports.DisplayAdmin = async (req, res) => {
           contact_number: 1,
           email: 1,
           role: "$loginInfo.role",
-          password: "$loginInfo.password", // ⚠️ NOT RECOMMENDED IN PROD
           isVerified: "$loginInfo.isVerified",
           theme: "$loginInfo.theme",
           created_at: 1,
         },
       },
-    ]);
+    ]),
+    // Count pipeline
+    Admin.aggregate([
+      ...basePipeline,
+      { $count: "total" },
+    ]),
+  ]);
 
-    res.status(200).json({
-      status: "success",
-      data: adminResults,
-      totalAdmin: adminResults.length,
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: "fail",
-      message: error.message,
-    });
-  }
-};
+  const totalRecords = countResult[0]?.total || 0;
+
+  res.status(200).json({
+    status: "success",
+    totalRecords,
+    totalAdmin: totalRecords, // backwards compat sa lumang frontend
+    currentPage: pageNum,
+    totalPages: Math.ceil(totalRecords / limitNum),
+    limit: limitNum,
+    count: dataResult.length,
+    data: dataResult,
+  });
+});
+
 exports.DisplayProfile = AsyncErrorHandler(async (req, res) => {
   const loggedInAdminId = req.user.linkId;
   const admin = await Admin.findById(loggedInAdminId);
