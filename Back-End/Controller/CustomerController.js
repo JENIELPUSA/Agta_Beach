@@ -1,6 +1,40 @@
 const Customer = require("../Models/CustomerSchema");
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 
+const Admin = require("../Models/AdminSchema")
+
+exports.getProfileData = AsyncErrorHandler(async (req, res) => {
+  const userId = req.user.linkId;
+
+  // 1. Hanapin muna sa Admin
+  let profile = await Admin.findById(userId);
+  let role = "Admin";
+
+  // 2. Kung wala sa Admin, hanapin sa Customer
+  if (!profile) {
+    profile = await Customer.findById(userId);
+    role = "Customer";
+  }
+
+  // 3. Kung wala sa pareho, mag-return ng 404
+  if (!profile) {
+    return res.status(404).json({
+      success: false,
+      message: "Profile not found",
+    });
+  }
+
+  // 4. Ibalik ang profile kasama ang role
+  res.status(200).json({
+    success: true,
+    role,
+    data: profile,
+  });
+});
+
+
+
+
 exports.createCustomer = AsyncErrorHandler(async (req, res) => {
   const { first_name, last_name, middle_name, gender, email } = req.body;
 
@@ -28,7 +62,6 @@ exports.createCustomer = AsyncErrorHandler(async (req, res) => {
     data: customer,
   });
 });
-
 
 // controllers/customerController.js
 

@@ -359,7 +359,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             deliveryStatus = "",
             startDate = "",
             endDate = "",
-            sort = "new", // ✅ NEW: "old" = oldest first (FIFO), "new" = newest first (LIFO)
+            sort = "new", // NEW: "old" = oldest first (FIFO), "new" = newest first (LIFO)
         } = req.query;
 
         console.log("Role:", role);
@@ -401,7 +401,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             ];
         }
 
-        // ✅ STATUS FILTER — case-insensitive, supports comma-separated
+        // STATUS FILTER — case-insensitive, supports comma-separated
         if (status.trim()) {
             // Kung may comma (e.g. "pending,processing"), gawing $in
             const statusList = status
@@ -442,7 +442,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
         }
 
         // ============================================
-        // ✅ SORT BY createdAt
+        // SORT BY createdAt
         //    "old" -> oldest first (FIFO)
         //    "new" -> newest first (LIFO, default)
         // ============================================
@@ -465,7 +465,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
                 $match: matchStage,
             },
             {
-                $sort: sortStage, // ✅ Applied sort
+                $sort: sortStage, // Applied sort
             },
             {
                 $facet: {
@@ -517,7 +517,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
         const data = results[0]?.data || [];
         const totalOrders = results[0]?.totalCount[0]?.count || 0;
 
-        console.log(`✅ Returning ${data.length} orders (sort: ${sort})`);
+        console.log(`Returning ${data.length} orders (sort: ${sort})`);
 
         if (data.length === 0) {
             console.log("⚠️ No orders found.");
@@ -556,7 +556,7 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
         ]);
 
         // ============================================
-        // ✅ STATUS COUNTS — para sa badges sa frontend
+        // STATUS COUNTS — para sa badges sa frontend
         // ============================================
         const statusCountsRaw = await Order.aggregate([
             {
@@ -617,14 +617,14 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             totalOrders,
             currentPage: page,
             totalPages: Math.ceil(totalOrders / limit),
-            sort, // ✅ Ibalik ang sort para sa frontend
+            sort, // Ibalik ang sort para sa frontend
             stats: stats[0] || {
                 totalOrders: 0,
                 totalRevenue: 0,
                 totalQuantity: 0,
                 averageAmount: 0,
             },
-            statusCounts, // ✅ Normalized object
+            statusCounts, // Normalized object
             paymentStatusCounts,
             statuses,
             debug: {
@@ -926,7 +926,9 @@ exports.GetSingleOrder = AsyncErrorHandler(async (req, res) => {
 exports.UpdateOrder = AsyncErrorHandler(async (req, res) => {
     const orderID = req.params.id;
 
-    // Check if order exists
+    // ============================================================
+    //  1. Check if order exists
+    // ============================================================
     const existingOrder = await Order.findById(orderID);
     if (!existingOrder) {
         return res.status(404).json({
@@ -935,20 +937,81 @@ exports.UpdateOrder = AsyncErrorHandler(async (req, res) => {
         });
     }
 
-    // Remove fields that shouldn't be updated
+    // ============================================================
+    //  2. Remove fields that shouldn't be updated
+    // ============================================================
     const updateData = { ...req.body };
     delete updateData._id;
     delete updateData.createdAt;
     delete updateData.updatedAt;
 
-    console.log("🔄 Updating order:", updateData);
+    // ============================================================
+    //  3. Compute diff — anong fields ang nabago
+    // ============================================================
+    const changedFields = [];
+    for (const key of Object.keys(updateData)) {
+        const oldValue = existingOrder[key];
+        const newValue = updateData[key];
 
+        // Compare via JSON para sa objects/arrays
+        if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+            changedFields.push({
+                field: key,
+                from: oldValue,
+                to: newValue,
+            });
+        }
+    }
+
+    // Kung walang nabago, hindi na kailangan mag-update
+    if (changedFields.length === 0) {
+        return res.status(200).json({
+            status: "success",
+            message: "No changes detected.",
+            data: existingOrder,
+        });
+    }
+
+    // ============================================================
+    //  4. Update order
+    // ============================================================
     const updatedOrder = await Order.findByIdAndUpdate(
         orderID,
         updateData,
         { new: true, runValidators: true }
     );
 
+    // ============================================================
+    //  5. Write audit trail
+    // ============================================================
+    try {
+        await AuditTrail.create({
+            performedBy: req.user?._id || null,
+            actorName: req.user
+                ? `${req.user.firstName || ""} ${req.user.lastName || ""}`.trim()
+                : "System",
+            actorRole: req.user?.role || "system",
+            action: "Updated order",
+            module: "Order",
+            targetId: updatedOrder._id,
+            targetLabel:
+                updatedOrder.referenceNo ||
+                updatedOrder.orderNumber ||
+                updatedOrder._id.toString(),
+            data: {
+                changedFields,      // ano ang nabago
+                before: existingOrder.toObject(), // opsyonal — buong lumang record
+                after: updatedOrder.toObject(),   // opsyonal — buong bagong record
+            },
+        });
+    } catch (auditErr) {
+        // Hindi dapat i-block ang main response kung nag-fail ang audit log
+        console.error("Audit log failed:", auditErr.message);
+    }
+
+    // ============================================================
+    //  6. Respond
+    // ============================================================
     res.status(200).json({
         status: "success",
         message: "Order updated successfully.",
@@ -960,8 +1023,10 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
     try {
         const orderID = req.params.id;
         const { status, note } = req.body;
+        const role = req.user?.role;
 
-        console.log("status", status);
+        console.log("userId", req.user?.userId);   // undefined ang userId dati
+        console.log("role", role);
 
         // Check if order exists
         const existingOrder = await Order.findById(orderID);
@@ -983,7 +1048,9 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
         const validStatuses = [
             "pending",
             "preparing",
-            "ready", "processing", "for delivery",
+            "ready",
+            "processing",
+            "for delivery",
             "delivering",
             "completed",
             "cancelled",
@@ -1002,7 +1069,7 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
         const previousStatus = existingOrder.status;
         const statusChanged = previousStatus !== status;
 
-        // No-op — return early (optional)
+        // No-op — return early
         if (!statusChanged) {
             return res.status(200).json({
                 status: "success",
@@ -1022,13 +1089,13 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
             { new: true, runValidators: true }
         );
 
-        // ======================
-        // 🛡️ WRITE AUDIT TRAIL
-        // ======================
-        try {
-            const actor = req.user.userId || {};
+        console.log("updatedOrder", updatedOrder);
 
-            console.log("actor",actor)
+        try {
+            const actor = req.user || {};
+
+            console.log("actor", actor);
+
             const ipAddress =
                 req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
                 req.socket?.remoteAddress ||
@@ -1037,15 +1104,9 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
 
             await AuditTrail.create({
                 // ---------- WHO ----------
-                performedBy: actor._id || actor.id || null,
-                performedByModel: actor.model || "Admin",
-                actorSnapshot: {
-                    firstName: actor.firstName || "",
-                    lastName: actor.lastName || "",
-                    email: actor.email || "",
-                    role: actor.role || "admin",
-                },
-
+                // Ang gumawa ng action ay ang actor (admin/staff), HINDI ang customer
+                performedBy: updatedOrder.userId,
+                performedByModel: role || "Admin",
                 // ---------- WHAT ----------
                 type: "STATUS_CHANGE",
                 action: "UpdateOrderStatus",
@@ -1059,20 +1120,19 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
                 targetId: updatedOrder._id,
                 targetModel: "Order",
                 targetLabel:
-                    updatedOrder.orderNumber ||
+                    updatedOrder.orderId ||              // tamang field
                     updatedOrder.reference ||
                     `Order #${updatedOrder._id}`,
-                ownerId: updatedOrder.user || updatedOrder.customer || null,
+                ownerId:
+                    updatedOrder.customer?.id ||         // nasa customer.id
+                    updatedOrder.userId ||                // tamang field
+                    null,
 
                 // ---------- DIFF ----------
                 beforeChange: { status: previousStatus },
                 afterChange: { status },
                 changedFields: [
-                    {
-                        field: "status",
-                        from: previousStatus,
-                        to: status,
-                    },
+                    { field: "status", from: previousStatus, to: status },
                 ],
 
                 // ---------- CONTEXT ----------
@@ -1089,9 +1149,11 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
                 metadata: {
                     note: note || null,
                     orderType: updatedOrder.type || null,
-                    totalAmount: updatedOrder.totalAmount || null,
+                    totalAmount: updatedOrder.totals?.totalAmount || null, // nasa totals
                     previousStatus,
                     newStatus: status,
+                    customerName: updatedOrder.customer?.name || null,
+                    customerRoom: updatedOrder.customer?.room || null,
                 },
             });
 
@@ -1100,13 +1162,15 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
             // Non-blocking — don't fail the main request if audit write fails
             console.error("⚠️ Failed to write audit trail:", auditError);
 
-            // Optional: log a "failure" audit entry too
+            // Failure audit entry
             try {
                 await AuditTrail.create({
+                    performedBy: updatedOrder.userId,
+                    performedByModel: role || "System",
                     type: "STATUS_CHANGE",
                     action: "UpdateOrderStatus",
                     module: "Order",
-                    message: `Failed to write audit trail for order ${orderID}`,
+                    message: `Failed to write audit trail for order ${orderID}`, // defined na
                     level: "error",
                     targetId: updatedOrder._id,
                     targetModel: "Order",
@@ -1133,9 +1197,15 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
         // ======================
         try {
             const actor = req.user || {};
+            const ipAddress =
+                req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+                req.socket?.remoteAddress ||
+                req.ip ||
+                null;
+
             await AuditTrail.create({
-                performedBy: actor._id || actor.id || null,
-                performedByModel: actor.model || "System",
+                performedBy: actor._id || actor.userId || actor.id || null,
+                performedByModel: actor.role || "System",
                 actorSnapshot: {
                     firstName: actor.firstName || "",
                     lastName: actor.lastName || "",
@@ -1149,19 +1219,13 @@ exports.UpdateOrderStatus = AsyncErrorHandler(async (req, res) => {
                 level: "error",
                 targetId: req.params.id || null,
                 targetModel: "Order",
-                ipAddress:
-                    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-                    req.socket?.remoteAddress ||
-                    req.ip ||
-                    null,
+                ipAddress,
                 userAgent: req.headers["user-agent"] || null,
                 method: req.method,
                 endpoint: req.originalUrl,
                 status: "failure",
                 errorMessage: error.message,
-                metadata: {
-                    body: req.body,
-                },
+                metadata: { body: req.body },
             });
         } catch (auditError) {
             console.error("⚠️ Failed to write failure audit trail:", auditError);

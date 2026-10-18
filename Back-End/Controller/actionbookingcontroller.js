@@ -1763,9 +1763,6 @@ exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-// =====================================
-// CREATE BOOKING
-// =====================================
 exports.createBooking = AsyncErrorHandler(async (req, res) => {
   try {
     const {
@@ -1775,17 +1772,15 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
       last_name,
       middle_name,
       suffix,
+      email,
+      password,
       expected_stay,
       checkIn,
       checkOut,
       userId,
     } = req.body;
-    const role = req.user.role;
 
-    console.log("role", role);
-    console.log("CREATE BOOKING REQUEST BODY:", req.body);
-    console.log("📍 checkIn:", checkIn);
-    console.log("📍 checkOut:", checkOut);
+    const role = req.user.role;
 
     let guestUserId = null;
     let customerId = null;
@@ -1793,7 +1788,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     let shouldCreateUser = true;
 
     // =====================================
-    // 1. CHECK IF USER IS RECEPTIONIST OR ADMIN
+    // 1. RECEPTIONIST / ADMIN — WALK-IN
     // =====================================
     if (role === "receptionist" || role === "admin") {
       isWalkin = true;
@@ -1805,6 +1800,9 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         );
       }
 
+      // =====================================
+      // 1A. EXISTING USER (may userId)
+      // =====================================
       if (userId) {
         const existingUser = await UserLoginSchema.findById(userId);
 
@@ -1829,12 +1827,49 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
             message: "User not found with the provided userId",
           });
         }
-      } else {
+      }
+
+      // =====================================
+      // 1B. NEW WALK-IN (walang userId)
+      // =====================================
+      else {
+        // -------------------------------------
+        // ✅ VALIDATE email + password (para sa lahat ng bagong walk-in)
+        // -------------------------------------
+        if (!email || !email.trim()) {
+          return res.status(400).json({
+            success: false,
+            message: "Email is required for new walk-in guests.",
+          });
+        }
+        if (!password || password.length < 6) {
+          return res.status(400).json({
+            success: false,
+            message: "Password must be at least 6 characters.",
+          });
+        }
+
+        // Check kung existing na ang email (para sa lahat ng bagong user)
+        const emailExists = await UserLoginSchema.findOne({
+          email: email.toLowerCase().trim(),
+        });
+        if (emailExists) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "Email is already registered. Please use a different email.",
+          });
+        }
+
+        // -------------------------------------
+        // 1B-1. Create Customer profile
+        // -------------------------------------
         const customer = await Customer.create({
           first_name: first_name || "",
           last_name: last_name || "",
           middle_name: middle_name || "",
           suffix: suffix || "",
+          email: email.toLowerCase().trim(), // ✅ FIXED: idinagdag ang email value
           avatar: {
             url: "",
             public_id: "",
@@ -1842,28 +1877,65 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         });
 
         customerId = customer._id;
-        console.log(` Created customer: ${first_name} ${last_name}`);
+        console.log(
+          `✅ Created customer: ${first_name} ${last_name} (${customerId})`
+        );
 
+        // -------------------------------------
+        // 1B-2. Create UserLogin account
+        // -------------------------------------
         if (shouldCreateUser) {
           const existingUser = await UserLoginSchema.findOne({
             linkedId: customerId,
           });
 
           if (!existingUser) {
-            const guestFirstName = first_name || "guest";
-            const username = `${guestFirstName.toLowerCase()}guestagta@gmail.com`;
-            const password = "default123";
+            console.log("🔐 Creating UserLoginSchema with:", {
+              email: email.toLowerCase().trim(),
+              username: email.toLowerCase().trim(),
+              role: "customer",
+              linkedId: customerId,
+              passwordLength: password.length,
+            });
 
             const newUser = await UserLoginSchema.create({
-              username: username,
+              first_name: first_name || "",
+              last_name: last_name || "",
+              middle_name: middle_name || "",
+              suffix: suffix || "",
+              email: email.toLowerCase().trim(),
               password: password,
+              confirmPassword: password,
+              username: email.toLowerCase().trim(),
               role: "customer",
               linkedId: customerId,
               isVerified: true,
             });
 
             guestUserId = newUser._id;
-            console.log(` Created user account for guest: ${username}`);
+
+            // =====================================
+            // 🔍 VERIFY — i-query pabalik para sigurado
+            // =====================================
+            const verifyUser = await UserLoginSchema.findById(newUser._id)
+              .select("+password")
+              .lean();
+
+            console.log("=".repeat(60));
+            console.log("✅ USER CREATED — VERIFICATION");
+            console.log("=".repeat(60));
+            console.log("📧 email:", verifyUser?.email);
+            console.log("👤 username:", verifyUser?.username);
+            console.log(
+              "🔑 password:",
+              verifyUser?.password
+                ? `✅ HASHED (${verifyUser.password.substring(0, 15)}...)`
+                : "❌ MISSING"
+            );
+            console.log("🎭 role:", verifyUser?.role);
+            console.log("🔗 linkedId:", verifyUser?.linkedId);
+            console.log("✅ isVerified:", verifyUser?.isVerified);
+            console.log("=".repeat(60));
           } else {
             console.log(
               `👤 Guest already has user account: ${existingUser.username}`
@@ -1871,26 +1943,35 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
             guestUserId = existingUser._id;
           }
         } else {
+          // Rental / Service — temporary user lang
           console.log(
-            `ℹ️ No user account created for ${bookingItemModel} booking`
+            `ℹ️ No full user account created for ${bookingItemModel} booking`
           );
 
           const tempUser = await UserLoginSchema.create({
+            first_name: first_name || "",
+            last_name: last_name || "",
+            email: email.toLowerCase().trim(),
             username: `${first_name?.toLowerCase() || "guest"}_temp_${Date.now()}`,
-            password: "temporary",
+            password: password,
+            confirmPassword: password,
             role: "customer",
             linkedId: customerId,
             isVerified: false,
-            isTemporary: true,
           });
 
           guestUserId = tempUser._id;
           console.log(
-            ` Created temporary user account for ${bookingItemModel} booking`
+            `✅ Created temporary user account for ${bookingItemModel} booking (${tempUser._id})`
           );
         }
       }
-    } else {
+    }
+
+    // =====================================
+    // 2. NON-RECEPTIONIST (regular user)
+    // =====================================
+    else {
       customerId = req.body.userId || req.body.customerId;
       isWalkin = false;
 
@@ -1905,7 +1986,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     }
 
     // =====================================
-    // 2. DETERMINE BOOKING STATUS
+    // 3. DETERMINE BOOKING STATUS
     // =====================================
     const bookingStatus = isWalkin ? "Confirmed" : "Pending";
     console.log(
@@ -1913,7 +1994,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     );
 
     // =====================================
-    // 3. COMPUTE CHECK-IN / CHECK-OUT
+    // 4. COMPUTE CHECK-IN / CHECK-OUT
     // =====================================
     const finalCheckIn = checkIn ? new Date(checkIn) : new Date();
 
@@ -1929,7 +2010,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     console.log("📍 Final checkOut:", finalCheckOut);
 
     // =====================================
-    // 3.5 COMPUTE UNIT PRICE, ISWEEKEND, TOTAL PRICE
+    // 4.5 COMPUTE UNIT PRICE / WEEKEND / TOTAL
     // =====================================
     const unitPrice = await getItemUnitPrice(
       bookingItemId,
@@ -1947,7 +2028,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     console.log("💰 totalPrice:", totalPrice);
 
     // =====================================
-    // 4. CREATE BOOKING
+    // 5. CREATE BOOKING
     // =====================================
     const booking = await ActionBooking.create({
       customerId: guestUserId,
@@ -1959,19 +2040,17 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
       checkOut: finalCheckOut,
       status: bookingStatus,
 
-      //  BAGONG FIELDS
       unitPrice: req.body.unitPrice,
       isWeekend: req.body.isWeekend,
       totalPrice: req.body.totalPrice,
       weekdaysPrice: req.body.weekdaysPrice,
-      isWeekend: req.body.isWeekend,
       weekendPrice: req.body.weekendPrice,
       weekdaysBreakfastPrice: req.body.weekdaysBreakfastPrice,
-      weekendBreakfastPrice: req.body.weekendBreakfastPrice
+      weekendBreakfastPrice: req.body.weekendBreakfastPrice,
     });
 
     // =====================================
-    // 5. AGGREGATION (FULL DETAILS)
+    // 6. AGGREGATION (FULL DETAILS)
     // =====================================
     const detailedBookingArray = await ActionBooking.aggregate([
       { $match: { _id: booking._id } },
@@ -2123,7 +2202,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     const finalBookingData = detailedBookingArray[0];
 
     // =====================================
-    // 6. SOCKET EMIT (BOOKING)
+    // 7. SOCKET EMIT (BOOKING)
     // =====================================
     const io = req.app.get("socketio");
 
@@ -2146,7 +2225,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     }).select("_id");
 
     // =====================================
-    // 7. CREATE NOTIFICATION
+    // 8. CREATE NOTIFICATION
     // =====================================
     const viewersList = staffMembers.map((staff) => ({
       user: staff._id,
@@ -2160,7 +2239,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     });
 
     // =====================================
-    // 8. SOCKET EMIT (NOTIFICATION)
+    // 9. SOCKET EMIT (NOTIFICATION)
     // =====================================
     if (io) {
       const notifPayload = {
@@ -2178,7 +2257,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     }
 
     // =====================================
-    // 9. RESPONSE
+    // 10. RESPONSE
     // =====================================
     const responseData = {
       success: true,
@@ -2198,20 +2277,18 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         responseData.customerInfo = {
           customerId: customerId,
           name: `${first_name} ${last_name}`,
+          email: email,
           bookingType: bookingItemModel,
           hasUserAccount: shouldCreateUser,
-          username: shouldCreateUser
-            ? `${first_name?.toLowerCase() || "guest"}guestagta@gmail.com`
-            : null,
-          password: shouldCreateUser ? "default123" : null,
+          username: shouldCreateUser ? email : null,
           isWalkin: true,
           expected_stay: expected_stay || 1,
           checkIn: finalCheckIn,
           checkOut: finalCheckOut,
           status: bookingStatus,
-          unitPrice: unitPrice,
-          isWeekend: isWeekend,
-          totalPrice: totalPrice,
+          unitPrice: req.body.unitPrice,
+          isWeekend: req.body.isWeekend,
+          totalPrice: req.body.totalPrice,
           message: shouldCreateUser
             ? "Customer and user account created"
             : "Customer created (no user account for rentals/services)",
@@ -2221,7 +2298,11 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
 
     res.status(201).json(responseData);
   } catch (error) {
-    console.error("CREATE BOOKING ERROR:", error);
+    console.error("=".repeat(60));
+    console.error("❌ CREATE BOOKING ERROR:", error);
+    console.error("❌ Error message:", error.message);
+    console.error("❌ Error stack:", error.stack);
+    console.error("=".repeat(60));
 
     return res.status(500).json({
       success: false,

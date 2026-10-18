@@ -593,34 +593,71 @@ exports.resetPassword = AsyncErrorHandler(async (req, res, next) => {
 });
 
 exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
-  const user = await UserLogin.findById(req.user._id).select("+password");
+  try {
+    // ✅ DEBUG — tingnan kung ano ang dumarating
+    console.log("🔍 UPDATE PASSWORD BODY:", req.body);
 
-  if (!user) {
-    return next(new CustomError("User not found.", 404));
-  }
+    const { currentPassword, newPassword, confirmNewPassword } = req.body;
 
-  const isMatch = await user.comparePasswordInDb(
-    req.body.currentPassword,
-    user.password,
-  );
-  if (!isMatch) {
+    // ✅ Validation
+    if (!currentPassword) {
+      return next(new CustomError("Current password is required.", 400));
+    }
+    if (!newPassword || newPassword.length < 6) {
+      return next(
+        new CustomError("New password must be at least 6 characters.", 400)
+      );
+    }
+    if (newPassword !== confirmNewPassword) {
+      return next(
+        new CustomError("New password and confirm password do not match.", 400)
+      );
+    }
+
+    const user = await UserLogin.findById(req.user._id).select("+password");
+
+    if (!user) {
+      return next(new CustomError("User not found.", 404));
+    }
+
+    // ✅ Compare current password
+    const isMatch = await user.comparePasswordInDb(
+      currentPassword,
+      user.password
+    );
+
+    if (!isMatch) {
+      return next(
+        new CustomError("The current password you provided is wrong", 401)
+      );
+    }
+
+    // ✅ I-set ang BAGONG password
+    user.password = newPassword;
+    user.confirmPassword = confirmNewPassword;
+
+    await user.save();
+
+    const token = signToken(user._id);
+
+    // ✅ Alisin ang sensitive fields sa response
+    user.password = undefined;
+    user.confirmPassword = undefined;
+
+    res.status(200).json({
+      status: "success",
+      token,
+      data: { user },
+    });
+  } catch (error) {
+    console.error("❌ UPDATE PASSWORD ERROR:", error);
     return next(
-      new CustomError("The current password you provided is wrong", 401),
+      new CustomError(
+        error.message || "Failed to update password. Please try again.",
+        500
+      )
     );
   }
-
-  user.password = req.body.password;
-  user.confirmPassword = req.body.confirmPassword;
-  await user.save();
-
-  const token = signToken(user._id);
-  res.status(200).json({
-    status: "success",
-    token,
-    data: {
-      user,
-    },
-  });
 });
 
 

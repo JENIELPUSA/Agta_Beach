@@ -32,6 +32,8 @@ const BillingHistoryRoute = require("./Routes/BillingHistoryRoute")
 
 const StatisticalRoute = require("./Routes/StatisticalRoute")
 
+const audittrail = require("./Routes/AuditTrailRoute")
+
 const FoodRoute = require("./Routes/FoodRoute")
 let app = express();
 
@@ -93,6 +95,8 @@ app.use("/api/v1/orders", OrderRoute);
 app.use("/api/v1/cartFood", CardRoute);
 app.use("/api/v1/billing", BillingHistoryRoute);
 app.use("/api/v1/statistical", StatisticalRoute);
+app.use("/api/v1/audit-logs", audittrail)
+
 
 
 app.use(ErrorController);

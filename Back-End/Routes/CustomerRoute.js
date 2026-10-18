@@ -8,6 +8,9 @@ router.route('/')
     router.route('/Profile')
     .post(authController.protect,customerController.createCustomer)
 
+router.route('/getProfile')
+    .get(authController.protect,customerController.getProfileData)
+
 
 router.route('/:id')
     .delete(authController.protect,customerController.deleteCustomer)

@@ -12,20 +12,9 @@ const AuditTrailSchema = new mongoose.Schema(
     },
     performedByModel: {
       type: String,
-      enum: ["Admin", "Officer", "Staff", "Customer", "System"],
+      enum: ["Admin", "Officer", "staff", "Customer", "System"],
       default: "System",
     },
-    actorSnapshot: {
-      firstName: { type: String, default: "" },
-      lastName: { type: String, default: "" },
-      email: { type: String, default: "" },
-      role: {
-        type: String,
-        enum: ["customer", "staff", "admin", "system", "guest"],
-        default: "system",
-      },
-    },
-
     // ============================================================
     //  WHAT — action details
     // ============================================================
