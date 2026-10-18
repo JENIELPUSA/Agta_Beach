@@ -1,10 +1,20 @@
 const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 const Notification = require("./../Models/NotificationSchema");
-const ApiFeatures = require("./../Utils/ApiFeatures");
 const mongoose = require("mongoose");
 
+// ============================================================
+// CREATE NOTIFICATION (admin)
+// body: { message, userIds: [linkId, ...] }
+// ============================================================
 exports.createNotification = AsyncErrorHandler(async (req, res) => {
-  const { message, userIds } = req.body; // userIds: [array of linkId]
+  const { message, userIds } = req.body;
+
+  if (!message || !Array.isArray(userIds) || userIds.length === 0) {
+    return res.status(400).json({
+      status: "fail",
+      message: "message and a non-empty userIds array are required",
+    });
+  }
 
   const viewers = userIds.map((id) => ({
     user: new mongoose.Types.ObjectId(id),
@@ -19,28 +29,35 @@ exports.createNotification = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-// Notification Controller
+// ============================================================
+// GET NOTIFICATIONS FOR A USER (paginated)
+// ============================================================
 exports.getByLinkId = AsyncErrorHandler(async (req, res) => {
   const { linkId } = req.params;
   const { limit, page } = req.query;
 
-  const query = { "viewers.user": linkId };
-  
-  // Pagination
-  const currentPage = parseInt(page) || 1;
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return res.status(400).json({ status: "fail", message: "Invalid linkId" });
+  }
+
+  const query = { "viewers.user": new mongoose.Types.ObjectId(linkId) };
+
+  const currentPage = Math.max(parseInt(page) || 1, 1);
   let itemsPerPage = parseInt(limit) || 10;
   if (itemsPerPage > 50) itemsPerPage = 50;
-  
+  if (itemsPerPage < 1) itemsPerPage = 10;
+
   const skip = (currentPage - 1) * itemsPerPage;
   const totalCount = await Notification.countDocuments(query);
-  
+
   const notifications = await Notification.find(query)
     .sort({ createdAt: -1 })
     .skip(skip)
-    .limit(itemsPerPage);
-  
-  const hasMore = (skip + notifications.length) < totalCount;
-  
+    .limit(itemsPerPage)
+    .lean();
+
+  const hasMore = skip + notifications.length < totalCount;
+
   res.status(200).json({
     status: "success",
     data: {
@@ -50,15 +67,15 @@ exports.getByLinkId = AsyncErrorHandler(async (req, res) => {
         itemsPerPage,
         totalCount,
         hasMore,
-        nextPage: hasMore ? currentPage + 1 : null
-      }
-    }
+        nextPage: hasMore ? currentPage + 1 : null,
+      },
+    },
   });
 });
 
-
-
-
+// ============================================================
+// MARK ONE AS READ
+// ============================================================
 exports.markAsRead = AsyncErrorHandler(async (req, res) => {
   const { id } = req.params;
   const { linkId } = req.body;
@@ -66,41 +83,74 @@ exports.markAsRead = AsyncErrorHandler(async (req, res) => {
   if (!linkId) {
     return res.status(400).json({ message: "linkId is required" });
   }
-
-  const notification = await Notification.findById(id);
-  if (!notification) {
-    return res.status(404).json({ message: "Notification not found" });
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(linkId)) {
+    return res.status(400).json({ message: "Invalid id or linkId" });
   }
 
-  const viewer = notification.viewers.find(
-    (v) => v.user.toString() === linkId
+  const result = await Notification.updateOne(
+    { _id: id, "viewers.user": new mongoose.Types.ObjectId(linkId) },
+    { $set: { "viewers.$[elem].isRead": true } },
+    {
+      arrayFilters: [
+        { "elem.user": new mongoose.Types.ObjectId(linkId), "elem.isRead": false },
+      ],
+    }
   );
 
-  if (!viewer) {
-    return res.status(403).json({ message: "Not authorized to read this notification" });
+  // matchedCount === 0  ->  notification not found OR user not in viewers
+  if (result.matchedCount === 0) {
+    return res.status(404).json({
+      message: "Notification not found or not authorized",
+    });
   }
 
-  if (!viewer.isRead) {
-    viewer.isRead = true;
-    await notification.save();
-  }
-
-  res.status(200).json({ message: "Notification marked as read" });
+  res.status(200).json({
+    status: "success",
+    message: "Notification marked as read",
+  });
 });
 
-exports.DisplayNotification = AsyncErrorHandler(async (req, res) => {
-  let limit = 5; // default limit
-  if (req.query.showAll === "true") {
-    limit = null;
+// ============================================================
+// MARK ALL AS READ FOR A USER
+// ============================================================
+exports.markAllAsRead = AsyncErrorHandler(async (req, res) => {
+  const { linkId } = req.body;
+
+  if (!linkId) {
+    return res.status(400).json({ message: "linkId is required" });
   }
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return res.status(400).json({ message: "Invalid linkId" });
+  }
+
+  const userObjId = new mongoose.Types.ObjectId(linkId);
+
+  const result = await Notification.updateMany(
+    { "viewers.user": userObjId, "viewers.isRead": false },
+    { $set: { "viewers.$[elem].isRead": true } },
+    {
+      arrayFilters: [{ "elem.user": userObjId, "elem.isRead": false }],
+    }
+  );
+
+  res.status(200).json({
+    status: "success",
+    message: "All notifications marked as read",
+    modifiedCount: result.modifiedCount,
+  });
+});
+
+// ============================================================
+// DISPLAY (admin view — recent or all)
+// ============================================================
+exports.DisplayNotification = AsyncErrorHandler(async (req, res) => {
+  const showAll = req.query.showAll === "true";
+  const limit = showAll ? null : 5;
 
   let query = Notification.find().sort({ createdAt: -1 });
+  if (limit) query = query.limit(limit);
 
-  if (limit) {
-    query = query.limit(limit);
-  }
-
-  const dataNotification = await query;
+  const dataNotification = await query.lean();
 
   res.status(200).json({
     status: "success",
@@ -109,10 +159,17 @@ exports.DisplayNotification = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-
-
+// ============================================================
+// DELETE
+// ============================================================
 exports.deleteNotification = AsyncErrorHandler(async (req, res) => {
-  const deleted = await Notification.findByIdAndDelete(req.params.id);
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ status: "fail", message: "Invalid id" });
+  }
+
+  const deleted = await Notification.findByIdAndDelete(id);
 
   if (!deleted) {
     return res.status(404).json({
@@ -121,87 +178,5 @@ exports.deleteNotification = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  res.status(200).json({
-    status: "success",
-    data: null,
-  });
-});
-
-
-
-exports.AddNews = AsyncErrorHandler(async (req, res) => {
-
-  try {
-    const {
-      title,
-      date,
-      excerpt,
-      category,
-      image,
-    } = req.body;
-
-    const missingFields = [];
-    requiredFields.forEach((field) => {
-      if (!req.body[field]) {
-        missingFields.push(
-          field.replace("_", " ").replace(/\b\w/g, (c) => c.toUpperCase())
-        );
-      }
-    });
-
-    if (missingFields.length > 0) {
-      return res.status(400).json({
-        message: `Missing required fields: ${missingFields.join(", ")}`,
-      });
-    }
-
-    // 🔹 Check if user already exists
-    const existingUser = await UserLogin.findOne({ username: email });
-    if (existingUser) {
-      return res.status(400).json({
-        message: "User with this email already exists!",
-      });
-    }
-
-    // 🔸 Handle image upload if avatar is present
-    let avatarUploadPromise = Promise.resolve({ url: "", public_id: "" });
-
-    if (req.file) {
-      avatarUploadPromise = sharp(req.file.buffer)
-        .resize({ width: 512 })
-        .jpeg({ quality: 80 })
-        .toBuffer()
-        .then((resizedBuffer) => {
-          const base64Image = `data:${
-            req.file.mimetype
-          };base64,${resizedBuffer.toString("base64")}`;
-          return cloudinary.uploader.upload(base64Image, {
-            folder: "Government Archiving/Profile",
-          });
-        })
-        .then((uploadedResponse) => ({
-          url: uploadedResponse.secure_url,
-          public_id: uploadedResponse.public_id,
-        }));
-    }
-
-    // 🔹 Wait for avatar upload to finish
-    const avatar = await avatarUploadPromise;
-  
-    if (gender) profileData.gender = gender;
-
-    const linkedRecord = await profileModel.create(profileData);
-
-    return res.status(201).json({
-      status: "Success",
-      user: newUserLogin,
-      profile: linkedRecord,
-    });
-  } catch (error) {
-    console.error("Signup Error:", error);
-    return res.status(500).json({
-      message: "Something went wrong during signup.",
-      error: error.message,
-    });
-  }
+  res.status(200).json({ status: "success", data: null });
 });

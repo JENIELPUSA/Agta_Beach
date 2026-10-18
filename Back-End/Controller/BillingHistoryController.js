@@ -2668,8 +2668,8 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       io.to("receptionist").emit("newNotification", notifPayload);
     }
 
-    // ==================== SEND EMAIL ONLY WHEN STATUS IS "completed" ====================
-    if (status === "completed") {
+    // ==================== SEND EMAIL FOR BOTH "completed" AND "partial" STATUSES ====================
+    if (status === "completed" || (status === "verified" && !isFullyPaid)) {
       const customerId = updatedBilling.processedBy?.userId;
 
       if (!customerId) {
@@ -2683,14 +2683,57 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
         if (!userLogin || !userLogin.username) {
           console.warn(`⚠️ No user login found for linkedId: ${customerId}`);
         } else {
+          // Determine payment status label
+          const paymentStatusLabel = isFullyPaid ? "Fully Paid" : "Partially Paid";
+
+          const emailSubject = isFullyPaid
+            ? `Payment Completed (Fully Paid) - ${updatedBilling.transactionId}`
+            : `Partial Payment Received (Partially Paid) - ${updatedBilling.transactionId}`;
+
+          const emailText = isFullyPaid
+            ? `Dear Customer,
+
+Your payment for billing transaction ${updatedBilling.transactionId} has been successfully completed.
+
+Payment Details:
+- Status: ${paymentStatusLabel} ✅
+- Amount Paid: ₱${(updatedBilling.paymentDetails?.amountPaid || 0).toFixed(2)}
+- Remaining Balance: ₱0.00
+- Payment Type: ${paymentType.toUpperCase()}
+
+Thank you for your full payment! Your transaction is now complete.
+
+You may log in to your account to view your billing details and payment history.
+
+Best regards,
+Billing Team`
+            : `Dear Customer,
+
+We have received your partial payment for billing transaction ${updatedBilling.transactionId}.
+
+Payment Details:
+- Status: ${paymentStatusLabel} ⏳
+- Amount Paid: ₱${(updatedBilling.paymentDetails?.amountPaid || 0).toFixed(2)}
+- Remaining Balance: ₱${remainingBalance.toFixed(2)}
+- Payment Type: ${paymentType.toUpperCase()}
+
+Please note that your remaining balance of ₱${remainingBalance.toFixed(2)} is still due. Kindly settle the remaining amount to complete your payment.
+
+You may log in to your account to view your billing details and payment history.
+
+Thank you for your partial payment!
+
+Best regards,
+Billing Team`;
+
           // Send email
           await sendEmail({
             email: userLogin.username, // username field holds the email
-            subject: "Please Check your email",
-            text: `Billing ${updatedBilling.transactionId} status updated to ${status}`,
+            subject: emailSubject,
+            text: emailText,
           });
 
-          console.log(`📧 Email sent to ${userLogin.username} for billing ${updatedBilling.transactionId}`);
+          console.log(`📧 ${paymentStatusLabel} email sent to ${userLogin.username} for billing ${updatedBilling.transactionId}`);
         }
       }
     }
