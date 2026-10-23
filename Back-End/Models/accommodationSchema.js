@@ -22,7 +22,6 @@ const accommodationSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
-    pricePerDay: Number,
 
     // Pricing fields
     weekdaysPrice: {
