@@ -1,3 +1,5 @@
+// ==================== FILE: Routes/BillingRoutes.js ====================
+
 const express = require("express");
 const router = express.Router();
 const upload = require("../middleware/fileUploader");
@@ -16,6 +18,22 @@ router
     upload.single("avatar"),
     billingHistoryController.createBillingHistory
   );
+
+// ==================== 📊 ANALYTICS / GRAPH ROUTES ====================
+// ⚠️ IMPORTANT: Ilagay ITO BAGO ang "/:id" route,
+//    para hindi ma-intercept ng "/:id" ang "/analytics/..." path.
+
+// 📈 Graph 1 — Accommodation revenue trend
+router
+  .route("/analytics/accommodation")
+  .get(authController.protect, billingHistoryController.getAccommodationGraph);
+
+// 🍽️ Graph 2 — Food orders revenue trend
+router
+  .route("/analytics/food")
+  .get(authController.protect, billingHistoryController.getFoodGraph);
+
+// ==================== OTHER ROUTES ====================
 
 // 📊 Statistics (frontend calls: GET /billing/statistics)
 router

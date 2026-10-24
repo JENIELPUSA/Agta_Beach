@@ -1,10 +1,12 @@
 const mongoose = require('mongoose');
+const Accommodation = require("../Models/accommodationSchema");
+
 
 // ==================== SUB-SCHEMAS ====================
 
 // Customer Schema
 const CustomerSchema = new mongoose.Schema({
-  _id: { type: String, required: true },
+  _id: { type: String, required: false },
   avatar: {
     url: { type: String, default: '' },
     public_id: { type: String, default: '' }
@@ -674,10 +676,14 @@ const PaymentDetailsSchema = new mongoose.Schema({
     required: true
   },
 
+  // ✅ FIXED: Required lang kung HINDI cash ang payment method
   referenceNo: {
     type: String,
-    required: true,
-    trim: true
+    required: function () {
+      return this.method && this.method !== 'cash';
+    },
+    trim: true,
+    default: ''
   },
 
   receipt: {
@@ -987,6 +993,10 @@ BillingHistorySchema.index({
 
 BillingHistorySchema.index({
   'bookings.bookingNumber': 1
+});
+
+BillingHistorySchema.index({
+  'bookings.orderNumber': 1
 });
 
 BillingHistorySchema.index({
@@ -1511,338 +1521,224 @@ BillingHistorySchema.statics.findBySelectedAccommodation =
     });
   };
 
-// ==================== HELPER: UPDATE ACCOMMODATION STATUS ====================
+// ==================== ✅ BAGO: CHECK DUPLICATE ORDER/BOKING ====================
 
-const updateAccommodationStatus =
-  async (
-    bookings,
-    transactionId
-  ) => {
+/**
+ * ✅ STATIC METHOD: Check kung existing na ang orderNumber o bookingNumber
+ * 
+ * @param {Object} params - { orderNumber, bookingNumber }
+ * @returns {Promise<Object>} - { isDuplicate, existingRecord, field }
+ */
+BillingHistorySchema.statics.checkDuplicate = async function ({
+  orderNumber,
+  bookingNumber,
+}) {
+  // Build query — check kung alinman sa dalawa ang existing
+  const orConditions = [];
 
-    try {
+  if (orderNumber && orderNumber.trim() !== '') {
+    orConditions.push({ 'bookings.orderNumber': orderNumber.trim() });
+  }
 
-      if (
-        !bookings ||
-        bookings.length === 0
-      ) {
-        return;
-      }
+  if (bookingNumber && bookingNumber.trim() !== '') {
+    orConditions.push({ 'bookings.bookingNumber': bookingNumber.trim() });
+  }
 
-      let Accommodation;
+  // Kung walang laman, hindi duplicate
+  if (orConditions.length === 0) {
+    return { isDuplicate: false, existingRecord: null, field: null };
+  }
 
-      try {
+  const existing = await this.findOne({ $or: orConditions })
+    .select('_id transactionId status createdAt bookings')
+    .lean();
 
-        Accommodation =
-          mongoose.model(
-            'Accommodation'
-          );
+  if (!existing) {
+    return { isDuplicate: false, existingRecord: null, field: null };
+  }
 
-      } catch (e) {
+  // Determine kung alin ang nag-duplicate
+  let field = null;
+  if (orderNumber && orderNumber.trim() !== '') {
+    const foundOrder = existing.bookings?.find(
+      (b) => b.orderNumber === orderNumber.trim()
+    );
+    if (foundOrder) field = 'orderNumber';
+  }
+  if (!field && bookingNumber && bookingNumber.trim() !== '') {
+    const foundBooking = existing.bookings?.find(
+      (b) => b.bookingNumber === bookingNumber.trim()
+    );
+    if (foundBooking) field = 'bookingNumber';
+  }
 
-        try {
-
-          Accommodation =
-            require(
-              './Accommodation'
-            );
-
-        } catch (requireError) {
-
-          console.warn(
-            '⚠️ Accommodation model not found, skipping status update'
-          );
-
-          return;
-        }
-      }
-
-      // Priority 1:
-      // accommodationId
-
-      const directAccommodationIds =
-        bookings
-
-          .filter(
-            b =>
-              b.bookingItemModel ===
-                'Accommodation' &&
-              b.accommodationId &&
-              b.accommodationId
-                .toString()
-                .trim() !== ''
-          )
-
-          .map(
-            b =>
-              b.accommodationId
-                .toString()
-                .trim()
-          );
-
-      // Priority 2:
-      // bookingItemId
-
-      const fallbackIds =
-        bookings
-
-          .filter(
-            b =>
-              b.bookingItemModel ===
-                'Accommodation' &&
-              !b.accommodationId &&
-              b.bookingItemId &&
-              b.bookingItemId
-                .trim() !== ''
-          )
-
-          .map(
-            b =>
-              b.bookingItemId
-                .trim()
-          );
-
-      const accommodationIds =
-        [
-          ...new Set([
-            ...directAccommodationIds,
-            ...fallbackIds
-          ])
-        ];
-
-      if (
-        accommodationIds.length === 0
-      ) {
-
-        console.log(
-          'ℹ️ [updateAccommodationStatus] No accommodation IDs found'
-        );
-
-        return;
-      }
-
-      const result =
-        await Accommodation.updateMany(
-          {
-            _id: {
-              $in: accommodationIds
-            },
-
-            status: {
-              $ne: 'not available'
-            }
-          },
-
-          {
-            $set: {
-              status: 'not available'
-            }
-          }
-        );
-
-      console.log(
-        ` [BillingHistory] Updated ${result.modifiedCount}/${accommodationIds.length} accommodation(s) to "not available"`,
-        {
-          transactionId,
-          directIds:
-            directAccommodationIds.length,
-          fallbackIds:
-            fallbackIds.length
-        }
-      );
-
-    } catch (error) {
-
-      console.error(
-        '❌ [updateAccommodationStatus] Error:',
-        error
-      );
-    }
+  return {
+    isDuplicate: true,
+    existingRecord: existing,
+    field,
   };
+};
 
-// ==================== HELPER: UPDATE ACTIONBOOKING STATUS ====================
+/**
+ * ✅ STATIC METHOD: Check kung alinman sa array ng bookings ay duplicate na
+ * 
+ * @param {Array} bookings - Array ng booking objects
+ * @returns {Promise<Object>} - { isDuplicate, duplicates: Array }
+ */
+BillingHistorySchema.statics.checkBatchDuplicates = async function (bookings) {
+  if (!bookings || bookings.length === 0) {
+    return { isDuplicate: false, duplicates: [] };
+  }
 
-const updateActionBookingStatus =
-  async (
-    bookings,
-    paymentType,
-    transactionId
-  ) => {
+  // Collect lahat ng orderNumber at bookingNumber
+  const orderNumbers = [];
+  const bookingNumbers = [];
 
-    try {
-
-      if (
-        !bookings ||
-        bookings.length === 0
-      ) {
-
-        console.log(
-          'ℹ️ [updateActionBookingStatus] No bookings to process'
-        );
-
-        return;
-      }
-
-      let ActionBooking;
-
-      try {
-
-        ActionBooking =
-          mongoose.model(
-            'ActionBooking'
-          );
-
-      } catch (e) {
-
-        try {
-
-          ActionBooking =
-            require(
-              './ActionBooking'
-            );
-
-        } catch (requireError) {
-
-          console.warn(
-            '⚠️ ActionBooking model not found, skipping status update'
-          );
-
-          return;
-        }
-      }
-
-      const targetStatus =
-        paymentType === 'full'
-          ? 'Paid'
-          : 'waiting';
-
-      console.log(
-        `🎯 [updateActionBookingStatus] Target status: "${targetStatus}" (paymentType: "${paymentType}")`
-      );
-
-      const bookingNumbers = [];
-      const bookingItemIds = [];
-
-      bookings.forEach(
-        b => {
-
-          if (
-            b.bookingNumber &&
-            typeof b.bookingNumber ===
-              'string' &&
-            b.bookingNumber
-              .trim() !== ''
-          ) {
-
-            bookingNumbers.push(
-              b.bookingNumber.trim()
-            );
-          }
-
-          if (
-            b.bookingItemId &&
-            typeof b.bookingItemId ===
-              'string' &&
-            b.bookingItemId
-              .trim() !== ''
-          ) {
-
-            bookingItemIds.push(
-              b.bookingItemId.trim()
-            );
-          }
-        }
-      );
-
-      if (
-        bookingNumbers.length === 0 &&
-        bookingItemIds.length === 0
-      ) {
-
-        console.log(
-          'ℹ️ [updateActionBookingStatus] No booking numbers or item IDs found'
-        );
-
-        return;
-      }
-
-      const queryConditions = [];
-
-      if (
-        bookingNumbers.length > 0
-      ) {
-
-        queryConditions.push({
-          bookingNumber: {
-            $in: bookingNumbers
-          }
-        });
-      }
-
-      if (
-        bookingItemIds.length > 0
-      ) {
-
-        queryConditions.push({
-          bookingItemId: {
-            $in: bookingItemIds
-          }
-        });
-      }
-
-      const result =
-        await ActionBooking.updateMany(
-
-          {
-            $or: queryConditions,
-
-            status: {
-              $nin: [
-                'Cancelled',
-                'Rejected'
-              ]
-            }
-          },
-
-          {
-            $set: {
-              status: targetStatus
-            }
-          }
-        );
-
-      console.log(
-        ` [BillingHistory] Updated ${result.modifiedCount}/${result.matchedCount} ActionBooking(s) to "${targetStatus}"`,
-        {
-          transactionId,
-          paymentType,
-          bookingNumbers,
-          bookingItemIds
-        }
-      );
-
-      if (
-        result.matchedCount === 0
-      ) {
-
-        console.warn(
-          `⚠️ [updateActionBookingStatus] No ActionBooking matched.`,
-          {
-            bookingNumbers,
-            bookingItemIds
-          }
-        );
-      }
-
-    } catch (error) {
-
-      console.error(
-        '❌ [updateActionBookingStatus] Error:',
-        error
-      );
+  bookings.forEach((b) => {
+    if (b.orderNumber && String(b.orderNumber).trim() !== '') {
+      orderNumbers.push(String(b.orderNumber).trim());
     }
-  };
+    if (b.bookingNumber && String(b.bookingNumber).trim() !== '') {
+      bookingNumbers.push(String(b.bookingNumber).trim());
+    }
+  });
 
-// ==================== PRE-SAVE HOOKS ====================
+  if (orderNumbers.length === 0 && bookingNumbers.length === 0) {
+    return { isDuplicate: false, duplicates: [] };
+  }
+
+  // Query lahat ng existing records na nagma-match
+  const orConditions = [];
+  if (orderNumbers.length > 0) {
+    orConditions.push({ 'bookings.orderNumber': { $in: orderNumbers } });
+  }
+  if (bookingNumbers.length > 0) {
+    orConditions.push({ 'bookings.bookingNumber': { $in: bookingNumbers } });
+  }
+
+  const existingRecords = await this.find({ $or: orConditions })
+    .select('_id transactionId status bookings')
+    .lean();
+
+  // Collect duplicates
+  const duplicates = [];
+  const seenOrderNumbers = new Set();
+  const seenBookingNumbers = new Set();
+
+  existingRecords.forEach((record) => {
+    record.bookings?.forEach((b) => {
+      if (b.orderNumber && orderNumbers.includes(b.orderNumber)) {
+        if (!seenOrderNumbers.has(b.orderNumber)) {
+          seenOrderNumbers.add(b.orderNumber);
+          duplicates.push({
+            field: 'orderNumber',
+            value: b.orderNumber,
+            existingTransactionId: record.transactionId,
+            existingStatus: record.status,
+          });
+        }
+      }
+      if (b.bookingNumber && bookingNumbers.includes(b.bookingNumber)) {
+        if (!seenBookingNumbers.has(b.bookingNumber)) {
+          seenBookingNumbers.add(b.bookingNumber);
+          duplicates.push({
+            field: 'bookingNumber',
+            value: b.bookingNumber,
+            existingTransactionId: record.transactionId,
+            existingStatus: record.status,
+          });
+        }
+      }
+    });
+  });
+
+  return {
+    isDuplicate: duplicates.length > 0,
+    duplicates,
+  };
+};
+
+// ==================== ✅ PRE-SAVE HOOK: I-CHECK ANG DUPLICATE ====================
+
+BillingHistorySchema.pre('save', async function (next) {
+  try {
+    // ✅ Skip check kung UPDATE (hindi bagong document)
+    if (!this.isNew) {
+      return next();
+    }
+
+    // ✅ Collect lahat ng orderNumber at bookingNumber sa bagong document
+    const orderNumbers = [];
+    const bookingNumbers = [];
+
+    (this.bookings || []).forEach((b) => {
+      if (b.orderNumber && String(b.orderNumber).trim() !== '') {
+        orderNumbers.push(String(b.orderNumber).trim());
+      }
+      if (b.bookingNumber && String(b.bookingNumber).trim() !== '') {
+        bookingNumbers.push(String(b.bookingNumber).trim());
+      }
+    });
+
+    // ✅ Kung wala, skip
+    if (orderNumbers.length === 0 && bookingNumbers.length === 0) {
+      return next();
+    }
+
+    // ✅ Build query conditions
+    const orConditions = [];
+    if (orderNumbers.length > 0) {
+      orConditions.push({ 'bookings.orderNumber': { $in: orderNumbers } });
+    }
+    if (bookingNumbers.length > 0) {
+      orConditions.push({ 'bookings.bookingNumber': { $in: bookingNumbers } });
+    }
+
+    // ✅ Hanapin ang existing records
+    const existingRecords = await this.constructor
+      .find({ $or: orConditions })
+      .select('_id transactionId status bookings')
+      .lean();
+
+    if (existingRecords.length === 0) {
+      return next(); // Walang duplicate
+    }
+
+    // ✅ I-check kung alin sa mga ito ang duplicate
+    const duplicateErrors = [];
+
+    existingRecords.forEach((record) => {
+      record.bookings?.forEach((b) => {
+        if (b.orderNumber && orderNumbers.includes(b.orderNumber)) {
+          duplicateErrors.push(
+            `OrderNumber "${b.orderNumber}" already exists in transaction ${record.transactionId}`
+          );
+        }
+        if (b.bookingNumber && bookingNumbers.includes(b.bookingNumber)) {
+          duplicateErrors.push(
+            `BookingNumber "${b.bookingNumber}" already exists in transaction ${record.transactionId}`
+          );
+        }
+      });
+    });
+
+    if (duplicateErrors.length > 0) {
+      const error = new Error(
+        `Duplicate booking/order detected: ${duplicateErrors.join(', ')}`
+      );
+      error.code = 'DUPLICATE_BOOKING';
+      error.statusCode = 400;
+      return next(error);
+    }
+
+    return next();
+  } catch (error) {
+    console.error('❌ [BillingHistory pre-save] Duplicate check error:', error);
+    return next(error);
+  }
+});
+
+// ==================== PRE-SAVE HOOKS (ORIGINAL) ====================
 
 BillingHistorySchema.pre(
   'save',
@@ -1989,6 +1885,112 @@ BillingHistorySchema.pre(
   }
 );
 
+// ==================== HELPER: UPDATE ACCOMMODATION STATUS ====================
+
+async function updateAccommodationStatus(bookings, transactionId) {
+  try {
+    if (!bookings || !bookings.length) return;
+
+    // Collect accommodation IDs from bookings
+    const accommodationIds = [
+      ...new Set(
+        bookings
+          .filter(
+            (b) =>
+              b.bookingItemModel === 'Accommodation' &&
+              (b.accommodationId || b.bookingItemId)
+          )
+          .map((b) => (b.accommodationId || b.bookingItemId).toString())
+      ),
+    ];
+
+    if (accommodationIds.length === 0) return;
+
+    const result = await Accommodation.updateMany(
+      {
+        _id: { $in: accommodationIds },
+        status: { $ne: 'not available' },
+      },
+      {
+        $set: { status: 'not available' },
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log(
+        `✅ [updateAccommodationStatus] Updated ${result.modifiedCount} accommodation(s) from transaction ${transactionId}`
+      );
+    }
+  } catch (error) {
+    console.error('❌ [updateAccommodationStatus] Error:', error.message);
+  }
+}
+
+// ==================== HELPER: UPDATE ACTIONBOOKING STATUS ====================
+
+async function updateActionBookingStatus(bookings, paymentType, transactionId) {
+  try {
+    if (!bookings || !bookings.length) return;
+    if (!paymentType) return;
+
+    // Kunin ang ActionBooking model (safe kung wala pa)
+    let ActionBooking;
+    try {
+      ActionBooking = mongoose.model('ActionBooking');
+    } catch (e) {
+      try {
+        ActionBooking = require('../Models/ActionBookingSchema');
+      } catch (err) {
+        console.warn(
+          '⚠️ [updateActionBookingStatus] ActionBooking model not available — skipping'
+        );
+        return;
+      }
+    }
+
+    // Target status base sa payment type
+    let targetStatus = null;
+    if (paymentType === 'partial') {
+      targetStatus = 'waiting';
+    } else if (paymentType === 'full') {
+      targetStatus = 'Confirmed';
+    }
+
+    if (!targetStatus) return;
+
+    // Collect booking numbers
+    const bookingNumbers = [
+      ...new Set(
+        bookings
+          .filter(
+            (b) => b.bookingNumber && String(b.bookingNumber).trim() !== ''
+          )
+          .map((b) => String(b.bookingNumber).trim())
+      ),
+    ];
+
+    if (bookingNumbers.length === 0) return;
+
+    const result = await ActionBooking.updateMany(
+      {
+        bookingNumber: { $in: bookingNumbers },
+        status: { $nin: ['cancelled', 'Cancelled', 'completed', 'Completed'] },
+      },
+      {
+        $set: { status: targetStatus },
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log(
+        `✅ [updateActionBookingStatus] Updated ${result.modifiedCount} booking(s) to "${targetStatus}" from transaction ${transactionId}`
+      );
+    }
+  } catch (error) {
+    console.error('❌ [updateActionBookingStatus] Error:', error.message);
+  }
+}
+
 // ==================== POST-SAVE HOOK ====================
 
 BillingHistorySchema.post(
@@ -2122,23 +2124,6 @@ BillingHistorySchema.statics.syncAccommodationStatus =
         };
       }
 
-      let Accommodation;
-
-      try {
-
-        Accommodation =
-          mongoose.model(
-            'Accommodation'
-          );
-
-      } catch (e) {
-
-        Accommodation =
-          require(
-            './accommodationSchema'
-          );
-      }
-
       const result =
         await Accommodation.updateMany(
           {
@@ -2162,7 +2147,7 @@ BillingHistorySchema.statics.syncAccommodationStatus =
         );
 
       console.log(
-        ` [syncAccommodationStatus] Updated ${result.modifiedCount}/${accommodationIds.size} accommodation(s)`
+        `✅ [syncAccommodationStatus] Updated ${result.modifiedCount}/${accommodationIds.size} accommodation(s)`
       );
 
       return {
@@ -2242,7 +2227,7 @@ BillingHistorySchema.statics.syncActionBookingStatus =
       }
 
       console.log(
-        ` [syncActionBookingStatus] Processed ${partialCount} partial + ${fullCount} full payments`
+        `✅ [syncActionBookingStatus] Processed ${partialCount} partial + ${fullCount} full payments`
       );
 
       return {
