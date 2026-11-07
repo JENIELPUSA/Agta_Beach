@@ -126,15 +126,18 @@ exports.DisplayFood = AsyncErrorHandler(async (req, res) => {
     const {
         search = "",
         page = 1,
-        limit = 10,
-        category,      // ← CATEGORY FILTER
+        limit = 18, // ← default 18
+        category,
         status,
         sortBy = "createdAt",
         sortOrder = "desc",
+
+        // ── Cursor-based (lazy loading) ──
+        cursor,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 18)); // ← fallback 18
     const skip = (pageNum - 1) * limitNum;
 
     // ─── 2. Build $match stage ──────────────────────────────────────
@@ -142,14 +145,11 @@ exports.DisplayFood = AsyncErrorHandler(async (req, res) => {
 
     // Search sa name (case-insensitive, escaped regex)
     if (search.trim()) {
-        const escaped = search
-            .trim()
-            .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         matchStage.name = { $regex: escaped, $options: "i" };
     }
 
-    // ─── CATEGORY FILTER ────────────────────────────────────────────
-    // Support both single category at multiple categories (comma-separated)
+    // Category filter
     if (category && category.trim()) {
         const categoryList = category
             .split(",")
@@ -166,41 +166,85 @@ exports.DisplayFood = AsyncErrorHandler(async (req, res) => {
     // Status filter
     if (status && status.trim()) matchStage.status = status.trim();
 
-    // ─── 3. Build $sort stage ───────────────────────────────────────
-    const allowedSortFields = [
-        "createdAt",
-        "updatedAt",
-        "name",
-        "price",
-    ];
+    // ─── 3. Sort stage ─────────────────────────────────────────────
+    const allowedSortFields = ["createdAt", "updatedAt", "name", "price"];
     const sortField = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
     const sortDir = sortOrder === "asc" ? 1 : -1;
 
-    // ─── 4. Execute data + count + categories in parallel ──────────
-    const [results, categories] = await Promise.all([
-        Food.aggregate([
-            { $match: matchStage },
-            { $sort: { [sortField]: sortDir } },
-            {
-                $facet: {
-                    data: [
-                        { $skip: skip },
-                        { $limit: limitNum },
-                    ],
-                    totalCount: [{ $count: "count" }],
-                },
+    // ─── 4. Cursor-based filter ────────────────────────────────────
+    const isCursorMode = !!cursor;
+
+    if (isCursorMode) {
+        const cursorDate = new Date(cursor);
+        if (!isNaN(cursorDate.getTime())) {
+            matchStage.createdAt =
+                sortDir === -1
+                    ? { $lt: cursorDate }
+                    : { $gt: cursorDate };
+        }
+    }
+
+    // ─── 5. Execute data + count + categories ──────────────────────
+    const pipeline = [
+        { $match: matchStage },
+        { $sort: { [sortField]: sortDir, _id: sortDir } },
+    ];
+
+    if (isCursorMode) {
+        // Cursor mode: limit + 1 (para malaman kung may next page)
+        pipeline.push({ $limit: limitNum + 1 });
+    } else {
+        // Legacy page mode
+        pipeline.push({
+            $facet: {
+                data: [{ $skip: skip }, { $limit: limitNum }],
+                totalCount: [{ $count: "count" }],
             },
-        ]),
-        // Kunin ang unique categories (para sa filter dropdown)
+        });
+    }
+
+    const [results, categories] = await Promise.all([
+        Food.aggregate(pipeline),
         Food.distinct("category"),
     ]);
 
+    // ─── 6. Response shape depende sa mode ─────────────────────────
+    if (isCursorMode) {
+        const fetched = Array.isArray(results) ? results : [];
+        const hasMore = fetched.length > limitNum;
+        const data = hasMore ? fetched.slice(0, limitNum) : fetched;
+
+        const nextCursor =
+            hasMore && data.length
+                ? new Date(
+                    data[data.length - 1].createdAt
+                ).toISOString()
+                : null;
+
+        return res.status(200).json({
+            status: "success",
+            mode: "cursor",
+            data,
+            count: data.length,
+            hasMore,
+            nextCursor,
+            limit: limitNum,
+            categories,
+            appliedFilters: {
+                search: search.trim() || null,
+                category: category?.trim() || null,
+                status: status?.trim() || null,
+            },
+        });
+    }
+
+    // Legacy page mode
     const data = results[0]?.data || [];
     const totalFood = results[0]?.totalCount[0]?.count || 0;
 
-    // ─── 5. Response ────────────────────────────────────────────────
     res.status(200).json({
         status: "success",
+        mode: "page",
         data,
         totalFood,
         totalRecords: totalFood,
@@ -208,9 +252,7 @@ exports.DisplayFood = AsyncErrorHandler(async (req, res) => {
         totalPages: Math.ceil(totalFood / limitNum),
         limit: limitNum,
         count: data.length,
-        categories, // ← listahan ng categories para sa dropdown
-
-        // Optional: ipakita ang active filter para sa frontend
+        categories,
         appliedFilters: {
             search: search.trim() || null,
             category: category?.trim() || null,

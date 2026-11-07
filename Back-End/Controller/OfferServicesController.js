@@ -10,7 +10,7 @@ const ActionBookingScheema = require("../Models/ActionBooking");
 exports.displayAllLimitOffers = async (req, res) => {
   try {
     const {
-      // ── Per-collection limits (optional) ──
+      // ── Per-collection limits ──
       accLimit = 4,
       svcLimit = 8,
       rentLimit = 10,
@@ -19,56 +19,61 @@ exports.displayAllLimitOffers = async (req, res) => {
       status,
       category,
       type,
+
+      // ── Per-collection cursors (load more) ──
+      cursorAcc,
+      cursorSvc,
+      cursorRent,
     } = req.query;
 
     // ─── Helper: sanitize limit ───────────────────────────────
     const sanitizeLimit = (val, fallback) => {
       const n = parseInt(val, 10);
       if (Number.isNaN(n) || n < 1) return fallback;
-      return Math.min(100, n); // cap sa 100
+      return Math.min(100, n);
     };
-
-    const accL = sanitizeLimit(accLimit, 4);
-    const svcL = sanitizeLimit(svcLimit, 8);
+    const accL  = sanitizeLimit(accLimit, 4);
+    const svcL  = sanitizeLimit(svcLimit, 8);
     const rentL = sanitizeLimit(rentLimit, 10);
 
-    // ─── Helper: build query ──────────────────────────────────
-    const buildQuery = (extra = {}) => {
+    // ─── Helper: build query + cursor ─────────────────────────
+    const buildQuery = (extra = {}, cursor) => {
       const q = { ...extra };
       if (status) q.status = status;
+      if (cursor) {
+        const d = new Date(cursor);
+        if (!Number.isNaN(d.getTime())) q.createdAt = { $lt: d };
+      }
       return q;
     };
 
     // ─── Build per-collection queries ─────────────────────────
-    const accQuery = buildQuery({ type: type || "room" });
-    const svcQuery = buildQuery();
-    if (category) svcQuery.category = category;
-    const rentQuery = buildQuery();
+    const accQuery  = buildQuery({ type: type || "room" }, cursorAcc);
+    const svcQuery  = buildQuery(category ? { category } : {}, cursorSvc);
+    const rentQuery = buildQuery({}, cursorRent);
 
-    // ─── Fetch paid bookings + offers in parallel ─────────────
-    const [paidBookings, accommodations, services, rentals] =
-      await Promise.all([
-        ActionBookingScheema.find({ status: "Paid" })
-          .select("bookingItemId bookingItemModel")
-          .lean(),
+    // ─── Fetch paid bookings + next slices in parallel ────────
+    // +1 trick para malaman kung may next pa
+    const [paidBookings, accDocs, svcDocs, rentDocs] = await Promise.all([
+      ActionBookingScheema.find({ status: "Paid" })
+        .select("bookingItemId bookingItemModel")
+        .lean(),
 
-        Accommodation.find(accQuery)
-          .sort({ createdAt: -1 })
-          .limit(accL)
-          .lean(),
+      Accommodation.find(accQuery).sort({ createdAt: -1 }).limit(accL + 1).lean(),
+      Service.find(svcQuery).sort({ createdAt: -1 }).limit(svcL + 1).lean(),
+      Rental.find(rentQuery).sort({ createdAt: -1 }).limit(rentL + 1).lean(),
+    ]);
 
-        Service.find(svcQuery)
-          .sort({ createdAt: -1 })
-          .limit(svcL)
-          .lean(),
+    // ─── Slice + hasMore per collection ───────────────────────
+    const slicePage = (docs, limit) => {
+      const hasMore = docs.length > limit;
+      return { items: hasMore ? docs.slice(0, limit) : docs, hasMore };
+    };
+    const accPage  = slicePage(accDocs,  accL);
+    const svcPage  = slicePage(svcDocs,  svcL);
+    const rentPage = slicePage(rentDocs, rentL);
 
-        Rental.find(rentQuery)
-          .sort({ createdAt: -1 })
-          .limit(rentL)
-          .lean(),
-      ]);
-
-    // ─── Build paidMap (safe sa null bookingItemId) ───────────
+    // ─── Build paidMap ────────────────────────────────────────
     const paidMap = new Map();
     (paidBookings || []).forEach((item) => {
       if (!item?.bookingItemId) return;
@@ -80,9 +85,7 @@ exports.displayAllLimitOffers = async (req, res) => {
       if (!Array.isArray(items)) return [];
       return items.map((item) => {
         const id = item?._id?.toString();
-        const isPaid =
-          id && paidMap.has(id) && paidMap.get(id) === modelName;
-
+        const isPaid = id && paidMap.has(id) && paidMap.get(id) === modelName;
         return {
           ...item,
           availabilityStatus: isPaid ? "Not Available" : "Available",
@@ -90,21 +93,21 @@ exports.displayAllLimitOffers = async (req, res) => {
       });
     };
 
-    const updatedAccommodations = updateStatus(
-      accommodations,
-      "Accommodation"
-    );
-    const updatedServices = updateStatus(services, "Service");
-    const updatedRentals = updateStatus(rentals, "Rental");
+    const updatedAccommodations = updateStatus(accPage.items, "Accommodation");
+    const updatedServices       = updateStatus(svcPage.items, "Service");
+    const updatedRentals        = updateStatus(rentPage.items, "Rental");
+
+    // ─── Build nextCursor per collection ──────────────────────
+    const makeCursor = (items, hasMore) => {
+      if (!hasMore || !items.length) return null;
+      const last = items[items.length - 1];
+      return last?.createdAt ? new Date(last.createdAt).toISOString() : null;
+    };
 
     // ─── Response ─────────────────────────────────────────────
     res.status(200).json({
       success: true,
-      limits: {
-        accommodations: accL,
-        services: svcL,
-        rentals: rentL,
-      },
+      limits: { accommodations: accL, services: svcL, rentals: rentL },
       count: {
         accommodations: updatedAccommodations.length,
         services: updatedServices.length,
@@ -114,6 +117,16 @@ exports.displayAllLimitOffers = async (req, res) => {
         accommodations: updatedAccommodations,
         services: updatedServices,
         rentals: updatedRentals,
+      },
+      cursors: {
+        accommodations: makeCursor(updatedAccommodations, accPage.hasMore),
+        services: makeCursor(updatedServices, svcPage.hasMore),
+        rentals: makeCursor(updatedRentals, rentPage.hasMore),
+      },
+      hasMore: {
+        accommodations: accPage.hasMore,
+        services: svcPage.hasMore,
+        rentals: rentPage.hasMore,
       },
     });
   } catch (error) {

@@ -9,15 +9,14 @@ const orders = require("../Models/OrderSchema");
 const Accommodation = require("../Models/ActionBooking");
 const sendEmail = require("../Utils/email");
 
+
 const axios = require("axios");
 const fs = require("fs");
 const FormData = require("form-data");
 
-// ==================== PAGINATION CONSTANTS ====================
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 
-// ==================== HELPER: Build Order Origin ====================
 const buildOrderOrigin = async (actionBooking, customerId = null) => {
   try {
     if (!actionBooking) return null;
@@ -254,10 +253,14 @@ const buildAnalyticsDateRange = (query = {}) => {
   return { start, end };
 };
 
-// ==================== CREATE ====================
+// Helper: escape regex special chars for case-insensitive exact matching
+const escapeRegex = (s = "") =>
+  String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
   console.log("BODY________", req.body);
+
+  const role = req.user.role;
 
   try {
     const parseIfString = (v) => {
@@ -273,14 +276,20 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     };
 
     const paymentDetails = parseIfString(req.body.paymentDetails);
-    const bookings       = parseIfString(req.body.bookings);
-    const processedBy    = parseIfString(req.body.processedBy);
-    const metadata       = parseIfString(req.body.metadata);
+    const bookings = parseIfString(req.body.bookings);
+    const processedBy = parseIfString(req.body.processedBy);
+    const metadata = parseIfString(req.body.metadata);
 
-    const selectedAccommodation        = paymentDetails?.selectedAccommodation || null;
-    const selectedAccommodationDetails = paymentDetails?.selectedAccommodationDetails || null;
+    const selectedAccommodation = paymentDetails?.selectedAccommodation || null;
+    const selectedAccommodationDetails =
+      paymentDetails?.selectedAccommodationDetails || null;
 
-    if (!paymentDetails || !bookings || !Array.isArray(bookings) || bookings.length === 0) {
+    if (
+      !paymentDetails ||
+      !bookings ||
+      !Array.isArray(bookings) ||
+      bookings.length === 0
+    ) {
       return res.status(400).json({
         success: false,
         message: "Payment details and at least one booking are required",
@@ -307,22 +316,118 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       }
     }
 
-    const computedTotal = bookings.reduce(
-      (sum, b) => sum + (Number(b.amount) || 0),
-      0
-    );
-    const providedTotal = Number(paymentDetails.totalAmount) || 0;
+    // ============================================================
+    // ✅ HELPER: Collect ALL lookup keys (orderNumber, bookingNumber,
+    //    referenceNo, _billingId, _transactionId)
+    // ============================================================
+    const collectLookupKeys = (bks) => ({
+      orderNumbers: bks
+        .map((b) => b.orderNumber)
+        .filter((n) => n && String(n).trim() !== "")
+        .map((n) => String(n).trim()),
+      bookingNumbers: bks
+        .map((b) => b.bookingNumber)
+        .filter((n) => n && String(n).trim() !== "")
+        .map((n) => String(n).trim()),
+      referenceNumbers: bks
+        .map((b) => b.referenceNo)
+        .filter((n) => n && String(n).trim() !== "")
+        .map((n) => String(n).trim()),
+      // 🆕 Idinagdag — ito ang reliable identifier mula sa partial billing
+      transactionIds: bks
+        .map((b) => b._transactionId || b.transactionId)
+        .filter((n) => n && String(n).trim() !== "")
+        .map((n) => String(n).trim()),
+      billingIds: bks
+        .map((b) => b._billingId)
+        .filter((n) => n && String(n).trim() !== "")
+        .map((n) => String(n).trim()),
+    });
 
-    if (Math.abs(computedTotal - providedTotal) > 0.01) {
-      console.warn(
-        `⚠️ Total mismatch: provided=₱${providedTotal}, computed=₱${computedTotal}`
+    const buildOrConditions = (keys) => {
+      const or = [];
+      if (keys.orderNumbers.length > 0) {
+        or.push({ "bookings.orderNumber": { $in: keys.orderNumbers } });
+      }
+      if (keys.bookingNumbers.length > 0) {
+        or.push({ "bookings.bookingNumber": { $in: keys.bookingNumbers } });
+      }
+      if (keys.referenceNumbers.length > 0) {
+        or.push({ "bookings.referenceNo": { $in: keys.referenceNumbers } });
+      }
+      if (keys.transactionIds.length > 0) {
+        or.push({ transactionId: { $in: keys.transactionIds } });
+      }
+      if (keys.billingIds.length > 0) {
+        or.push({ _id: { $in: keys.billingIds } });
+      }
+      return or;
+    };
+
+    const hasAnyKey = (keys) =>
+      keys.orderNumbers.length > 0 ||
+      keys.bookingNumbers.length > 0 ||
+      keys.referenceNumbers.length > 0 ||
+      keys.transactionIds.length > 0 ||
+      keys.billingIds.length > 0;
+
+    // ============================================================
+    // ✅ STEP 1: Check existing billing FIRST (bago total validation)
+    // ============================================================
+    const keysCheck = collectLookupKeys(bookings);
+    const ACTIVE_BILLING_STATUSES = [
+      "pending",
+      "verified",
+      "completed",
+      "fully_paid",
+      "partial",
+    ];
+
+    let existingBillingForValidation = null;
+    if (hasAnyKey(keysCheck)) {
+      const orConditionsForCheck = buildOrConditions(keysCheck);
+      existingBillingForValidation = await BillingHistory.findOne({
+        $or: orConditionsForCheck,
+        status: { $in: ACTIVE_BILLING_STATUSES },
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+    }
+
+    // ============================================================
+    // ✅ STEP 2: Detect additional payment
+    // ============================================================
+    const isAdditionalPayment =
+      existingBillingForValidation &&
+      existingBillingForValidation.status === "partial";
+
+    // ============================================================
+    // ✅ STEP 3: Total validation — SKIP kapag additional payment
+    // ============================================================
+    if (!isAdditionalPayment) {
+      const computedTotal = bookings.reduce(
+        (sum, b) => sum + (Number(b.amount) || 0),
+        0
       );
-      return res.status(400).json({
-        success: false,
-        message: `Total amount mismatch. Provided: ₱${providedTotal.toFixed(2)}, Computed: ₱${computedTotal.toFixed(2)}`,
-        providedTotal,
-        computedTotal,
-      });
+      const providedTotal = Number(paymentDetails.totalAmount) || 0;
+
+      if (Math.abs(computedTotal - providedTotal) > 0.01) {
+        console.warn(
+          `⚠️ Total mismatch: provided=₱${providedTotal}, computed=₱${computedTotal}`
+        );
+        return res.status(400).json({
+          success: false,
+          message: `Total amount mismatch. Provided: ₱${providedTotal.toFixed(
+            2
+          )}, Computed: ₱${computedTotal.toFixed(2)}`,
+          providedTotal,
+          computedTotal,
+        });
+      }
+    } else {
+      console.log(
+        `✅ [Additional Payment] Skipping total validation — existing partial billing ${existingBillingForValidation.transactionId}. New payment: ₱${Number(paymentDetails.paymentAmount || 0).toFixed(2)}`
+      );
     }
 
     let rawCustomerId = null;
@@ -339,6 +444,100 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         null;
     }
     if (!rawCustomerId && req.user) rawCustomerId = req.user._id || req.user.id;
+
+    // ============================================================
+    // 🆕 RECEPTIONIST FLOW — skip kapag additional payment
+    // ============================================================
+    if (role === "receptionist" && !isAdditionalPayment) {
+      const splitCustomerName = (fullName = "") => {
+        const cleaned = String(fullName).trim().replace(/\s+/g, " ");
+        if (!cleaned) {
+          return { first_name: "", last_name: "", suffix: "" };
+        }
+
+        const parts = cleaned.split(" ");
+        const SUFFIXES = ["jr.", "jr", "sr.", "sr", "ii", "iii", "iv", "v"];
+
+        let suffix = "";
+        if (
+          parts.length > 2 &&
+          SUFFIXES.includes(parts[parts.length - 1].toLowerCase())
+        ) {
+          suffix = parts.pop();
+        }
+
+        const first_name = parts[0] || "";
+        const last_name = parts.slice(1).join(" ") || "";
+        return { first_name, last_name, suffix };
+      };
+
+      const customerNameFromPayload = metadata?.customerName?.trim() || "";
+      const {
+        first_name: parsedFirst,
+        last_name: parsedLast,
+        suffix: parsedSuffix,
+      } = splitCustomerName(customerNameFromPayload);
+
+      let existingCustomer = null;
+
+      if (rawCustomerId && mongoose.Types.ObjectId.isValid(rawCustomerId)) {
+        existingCustomer = await Customer.findById(rawCustomerId).lean();
+      }
+
+      if (!existingCustomer && parsedFirst) {
+        existingCustomer = await Customer.findOne({
+          first_name: {
+            $regex: `^${escapeRegex(parsedFirst)}$`,
+            $options: "i",
+          },
+          last_name: {
+            $regex: `^${escapeRegex(parsedLast)}$`,
+            $options: "i",
+          },
+        }).lean();
+      }
+
+      if (!existingCustomer) {
+        if (!parsedFirst) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "Customer not found and no customerName provided in metadata. Cannot create billing.",
+          });
+        }
+
+        try {
+          const newCustomer = await Customer.create({
+            first_name: parsedFirst,
+            last_name: parsedLast,
+            middle_name: "",
+            suffix: parsedSuffix || "",
+            email: metadata?.email || "",
+            gender: metadata?.gender || undefined,
+          });
+
+          rawCustomerId = newCustomer._id;
+          console.log(
+            `🆕 [Receptionist] Created new customer: ${newCustomer._id} (${parsedFirst} ${parsedLast}${parsedSuffix ? " " + parsedSuffix : ""})`
+          );
+        } catch (createErr) {
+          console.error("❌ Failed to create customer:", createErr.message);
+          return res.status(500).json({
+            success: false,
+            message: "Failed to create customer for billing",
+            error: createErr.message,
+          });
+        }
+      } else {
+        rawCustomerId = existingCustomer._id;
+        console.log(
+          `✅ [Receptionist] Customer found: ${existingCustomer._id} (${existingCustomer.first_name} ${existingCustomer.last_name})`
+        );
+      }
+    }
+    // ============================================================
+    // END RECEPTIONIST FLOW
+    // ============================================================
 
     const accommodationBooking = bookings.find(
       (b) =>
@@ -366,7 +565,11 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
 
     const { customerId, customerDoc } = customerResolved;
 
-    if (actionBookingData) {
+    // ============================================================
+    // ✅ FIX: Skip ALLOWED_STATUSES check kapag additional payment
+    //    (dahil "completed" na ang booking status mula sa partial billing)
+    // ============================================================
+    if (actionBookingData && !isAdditionalPayment) {
       const ALLOWED_STATUSES = ["CheckIn", "Confirmed"];
       if (!ALLOWED_STATUSES.includes(actionBookingData.status)) {
         return res.status(400).json({
@@ -387,7 +590,8 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
         const related = await actionbooking
           .findOne({
             customerId:
-              actionBookingData.customerId?._id || actionBookingData.customerId,
+              actionBookingData.customerId?._id ||
+              actionBookingData.customerId,
             bookingItemModel: "Accommodation",
             status: { $in: ["Confirmed", "Paid", "waiting", "CheckIn"] },
           })
@@ -407,7 +611,9 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
               .catch(() => ""),
         actionbooking
           .find({ customerId, bookingItemModel: "Accommodation" })
-          .select("roomNumber delivery.roomNumber room.number location.roomNumber")
+          .select(
+            "roomNumber delivery.roomNumber room.number location.roomNumber"
+          )
           .limit(5)
           .lean()
           .catch(() => []),
@@ -447,44 +653,19 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       paymentDetails.paymentType === "partial"
         ? paymentDetails.totalAmount - paymentDetails.paymentAmount
         : 0;
-    const isFullyPaid   = remainingBalance <= 0;
+    const isFullyPaid = remainingBalance <= 0;
     const paymentStatus = isFullyPaid ? "completed" : "pending";
     const billingStatus = isFullyPaid ? "fully_paid" : "partial";
 
-    const allOrderNumbers = bookings
-      .map((b) => b.orderNumber)
-      .filter((n) => n && String(n).trim() !== "")
-      .map((n) => String(n).trim());
-
-    const allBookingNumbers = bookings
-      .map((b) => b.bookingNumber)
-      .filter((n) => n && String(n).trim() !== "")
-      .map((n) => String(n).trim());
-
-    const allReferenceNumbers = bookings
-      .map((b) => b.referenceNo)
-      .filter((n) => n && String(n).trim() !== "")
-      .map((n) => String(n).trim());
-
+    // ============================================================
+    // ✅ STEP 4: Actual existing billing lookup (para sa update path)
+    //    Gamitin ang PAREHONG keys (kasama _billingId/_transactionId)
+    // ============================================================
+    const keys = collectLookupKeys(bookings);
     let existingBilling = null;
-    const ACTIVE_BILLING_STATUSES = ["pending", "verified", "completed", "fully_paid", "partial"];
 
-    if (
-      allOrderNumbers.length > 0 ||
-      allBookingNumbers.length > 0 ||
-      allReferenceNumbers.length > 0
-    ) {
-      const orConditions = [];
-      if (allOrderNumbers.length > 0) {
-        orConditions.push({ "bookings.orderNumber": { $in: allOrderNumbers } });
-      }
-      if (allBookingNumbers.length > 0) {
-        orConditions.push({ "bookings.bookingNumber": { $in: allBookingNumbers } });
-      }
-      if (allReferenceNumbers.length > 0) {
-        orConditions.push({ "bookings.referenceNo": { $in: allReferenceNumbers } });
-      }
-
+    if (hasAnyKey(keys)) {
+      const orConditions = buildOrConditions(keys);
       existingBilling = await BillingHistory.findOne({
         $or: orConditions,
         status: { $in: ACTIVE_BILLING_STATUSES },
@@ -518,19 +699,40 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       }
 
       if (existingStatus === "partial") {
-        const matchingBookings = existingBilling.bookings.filter(
-          (b) =>
-            allOrderNumbers.includes(b.orderNumber) ||
-            allBookingNumbers.includes(b.bookingNumber) ||
-            allReferenceNumbers.includes(b.referenceNo)
-        );
+        // 🆕 Match gamit ang lahat ng keys (kasama _billingId/_transactionId/_id)
+        const matchingBookings = existingBilling.bookings.filter((b) => {
+          if (b._id && bookings.some((nb) => String(nb._id) === String(b._id))) {
+            return true;
+          }
+          if (
+            b._transactionId &&
+            keys.transactionIds.includes(String(b._transactionId))
+          ) {
+            return true;
+          }
+          return (
+            keys.orderNumbers.includes(b.orderNumber) ||
+            keys.bookingNumbers.includes(b.bookingNumber) ||
+            keys.referenceNumbers.includes(b.referenceNo)
+          );
+        });
 
         if (matchingBookings.length > 0) {
           const totalMatchingAmount = matchingBookings.reduce(
             (sum, b) => sum + (Number(b.amount) || 0),
             0
           );
-          const newPaymentAmount = Number(paymentDetails.paymentAmount) || 0;
+
+          // ✅ FIX: Kapag "full" paymentType, gamitin ang BUONG remaining balance
+          //    Hindi lang ang paymentAmount (na 750 lang)
+          const isFullPayment = paymentDetails.paymentType === "full";
+          const totalRemainingBefore = existingBilling.bookings.reduce(
+            (sum, b) => sum + (Number(b.remainingBalance) || 0),
+            0
+          );
+          const newPaymentAmount = isFullPayment
+            ? totalRemainingBefore
+            : Number(paymentDetails.paymentAmount) || 0;
 
           const updatedBookings = existingBilling.bookings.map((booking) => {
             const isMatching = matchingBookings.some(
@@ -583,7 +785,9 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
                 "paymentDetails.remainingBalance": newTotalRemaining,
                 "paymentDetails.paymentAmount": newTotalPaid,
                 "paymentDetails.status": newPaymentStatus,
-                "paymentDetails.paymentType": isNowFullyPaid ? "full" : "partial",
+                "paymentDetails.paymentType": isNowFullyPaid
+                  ? "full"
+                  : "partial",
                 "paymentDetails.method":
                   paymentDetails.method || existingBilling.paymentDetails.method,
                 "paymentDetails.referenceNo":
@@ -607,11 +811,18 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
                   status: newBillingStatus,
                   timestamp: new Date(),
                   note: isNowFullyPaid
-                    ? ` Fully Paid! Remaining balance: ₱0.00. Total paid: ₱${newTotalPaid.toFixed(2)}`
-                    : `💰 Additional partial payment of ₱${newPaymentAmount.toFixed(2)}. Remaining balance: ₱${newTotalRemaining.toFixed(2)}. Total paid: ₱${newTotalPaid.toFixed(2)}`,
+                    ? ` Fully Paid! Remaining balance: ₱0.00. Total paid: ₱${newTotalPaid.toFixed(
+                        2
+                      )}`
+                    : `💰 Additional partial payment of ₱${newPaymentAmount.toFixed(
+                        2
+                      )}. Remaining balance: ₱${newTotalRemaining.toFixed(
+                        2
+                      )}. Total paid: ₱${newTotalPaid.toFixed(2)}`,
                   updatedBy: {
                     userId: processedBy?.userId || req.user?._id || "system",
-                    userName: processedBy?.userName || req.user?.name || "System",
+                    userName:
+                      processedBy?.userName || req.user?.name || "System",
                   },
                 },
               },
@@ -619,26 +830,15 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
             { new: true }
           );
 
-          if (actionBookingData && actionBookingData.status !== "CheckIn") {
-            try {
-              await actionbooking.updateStatusWithTracking(
-                actionBookingData._id,
-                "CheckIn",
-                processedBy?.userId || req.user?._id || null,
-                `Additional billing: ${updatedBilling.transactionId}`
-              );
-            } catch (e) {
-              console.error("⚠️ ActionBooking status update:", e.message);
-            }
-          }
-
           const io = req.app.get("socketio");
           if (io) {
             const payload = {
               billingHistory: updatedBilling,
               message: isNowFullyPaid
                 ? ` Billing ${updatedBilling.transactionId} is now fully paid!`
-                : `💰 Additional payment for ${updatedBilling.transactionId} - Remaining: ₱${newTotalRemaining.toFixed(2)}`,
+                : `💰 Additional payment for ${
+                    updatedBilling.transactionId
+                  } - Remaining: ₱${newTotalRemaining.toFixed(2)}`,
             };
             io.to("admin").emit("updateBilling", payload);
             io.to("finance").emit("updateBilling", payload);
@@ -649,8 +849,14 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
               const viewersList = await getStaffViewers();
               const newNotification = await Notification.create({
                 message: isNowFullyPaid
-                  ? ` ${updatedBilling.transactionId} is now fully paid! (Total: ₱${newTotalPaid.toFixed(2)})`
-                  : `💰 Additional payment for ${updatedBilling.transactionId} - ₱${newPaymentAmount.toFixed(2)}. Remaining: ₱${newTotalRemaining.toFixed(2)}`,
+                  ? ` ${updatedBilling.transactionId} is now fully paid! (Total: ₱${newTotalPaid.toFixed(
+                      2
+                    )})`
+                  : `💰 Additional payment for ${
+                      updatedBilling.transactionId
+                    } - ₱${newPaymentAmount.toFixed(
+                      2
+                    )}. Remaining: ₱${newTotalRemaining.toFixed(2)}`,
                 FileId: updatedBilling._id,
                 viewers: viewersList,
               });
@@ -683,8 +889,20 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
                 ? "Payment Completed - Fully Paid"
                 : "Payment Received - Partially Paid";
               const text = isNowFullyPaid
-                ? `Your billing ${updatedBilling.transactionId} is now FULLY PAID. Total paid: ₱${newTotalPaid.toFixed(2)}. Remaining balance: ₱0.00. Thank you!`
-                : `We received your partial payment for billing ${updatedBilling.transactionId}.\n\nAmount paid: ₱${newPaymentAmount.toFixed(2)}\nTotal paid so far: ₱${newTotalPaid.toFixed(2)}\nRemaining balance: ₱${newTotalRemaining.toFixed(2)}\n\nThank you!`;
+                ? `Your billing ${
+                    updatedBilling.transactionId
+                  } is now FULLY PAID. Total paid: ₱${newTotalPaid.toFixed(
+                    2
+                  )}. Remaining balance: ₱0.00. Thank you!`
+                : `We received your partial payment for billing ${
+                    updatedBilling.transactionId
+                  }.\n\nAmount paid: ₱${newPaymentAmount.toFixed(
+                    2
+                  )}\nTotal paid so far: ₱${newTotalPaid.toFixed(
+                    2
+                  )}\nRemaining balance: ₱${newTotalRemaining.toFixed(
+                    2
+                  )}\n\nThank you!`;
 
               await sendEmail({ email: userLogin.username, subject, text });
             } catch (e) {
@@ -742,6 +960,9 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       }
     }
 
+    // ============================================================
+    // NEW BILLING PATH (walang existing)
+    // ============================================================
     const transactionId = BillingHistory.getTransactionId();
 
     const updatedBookings = decoratedBookings.map((booking) => {
@@ -790,7 +1011,8 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       customerId,
       paymentDetails: {
         ...paymentDetails,
-        paymentAmount: paymentDetails.paymentAmount || paymentDetails.totalAmount,
+        paymentAmount:
+          paymentDetails.paymentAmount || paymentDetails.totalAmount,
         paymentType: paymentDetails.paymentType || "full",
         remainingBalance,
         processedAt: paymentDetails.processedAt || new Date(),
@@ -811,22 +1033,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     });
 
     await billingHistory.save();
-
-    if (actionBookingData && actionBookingData.status !== "CheckIn") {
-      try {
-        await actionbooking.updateStatusWithTracking(
-          actionBookingData._id,
-          "CheckIn",
-          processedBy?.userId || req.user?._id || null,
-          `Billing created: ${billingHistory.transactionId}`
-        );
-        console.log(
-          ` [ActionBooking] ${actionBookingData._id} updated to CheckIn`
-        );
-      } catch (e) {
-        console.error("⚠️ ActionBooking status update:", e.message);
-      }
-    }
 
     const bookingIdsToUpdate = billingHistory.bookings
       .map((b) => b._id)
@@ -866,7 +1072,11 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
       try {
         const viewersList = await getStaffViewers();
         const newNotification = await Notification.create({
-          message: `New ${paymentDetails.paymentType} billing: ${billingHistory.transactionId} (₱${paymentDetails.paymentAmount.toFixed(2)}) - ${billingStatus}`,
+          message: `New ${
+            paymentDetails.paymentType
+          } billing: ${billingHistory.transactionId} (₱${paymentDetails.paymentAmount.toFixed(
+            2
+          )}) - ${billingStatus}`,
           FileId: billingHistory._id,
           viewers: viewersList,
         });
@@ -880,6 +1090,7 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
           };
           io.to("admin").emit("newNotification", notifPayload);
           io.to("finance").emit("newNotification", notifPayload);
+          io.to("receptionest").emit("createBooking", notifPayload);
         }
       } catch (e) {
         console.error("⚠️ notif:", e.message);
@@ -900,8 +1111,18 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
           ? "Payment Completed - Fully Paid"
           : "Payment Received - Partially Paid";
         const text = isFullyPaidNow
-          ? `Your billing ${billingHistory.transactionId} is FULLY PAID.\n\nTotal amount: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(2)}\nRemaining balance: ₱0.00\n\nThank you!`
-          : `We received your payment for billing ${billingHistory.transactionId}.\n\nAmount paid: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(2)}\nRemaining balance: ₱${billingHistory.paymentDetails.remainingBalance.toFixed(2)}\n\nThank you!`;
+          ? `Your billing ${
+              billingHistory.transactionId
+            } is FULLY PAID.\n\nTotal amount: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(
+              2
+            )}\nRemaining balance: ₱0.00\n\nThank you!`
+          : `We received your payment for billing ${
+              billingHistory.transactionId
+            }.\n\nAmount paid: ₱${billingHistory.paymentDetails.paymentAmount.toFixed(
+              2
+            )}\nRemaining balance: ₱${billingHistory.paymentDetails.remainingBalance.toFixed(
+              2
+            )}\n\nThank you!`;
 
         await sendEmail({ email: userLogin.username, subject, text });
       } catch (e) {
@@ -927,7 +1148,6 @@ exports.createBillingHistory = AsyncErrorHandler(async (req, res) => {
     });
   }
 });
-
 // ==================== GET ALL (PAGINATED) ====================
 
 exports.getAllBillingHistory = AsyncErrorHandler(async (req, res) => {
@@ -1509,8 +1729,6 @@ exports.getBillingStatistics = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-// ==================== GET PARTIAL PAYMENTS (PAGINATED) ====================
-
 exports.getPartialPayments = AsyncErrorHandler(async (req, res) => {
   const role = req.user?.role;
   const userId = req.user?.linkId;
@@ -1643,7 +1861,17 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
 
   const pipeline = [
     { $match: { $and: and } },
-    { $sort: { "paymentDetails.processedAt": -1 } },
+
+    // ── Compute a robust sort timestamp (fallback: createdAt) ──
+    {
+      $addFields: {
+        _sortTs: { $ifNull: ["$paymentDetails.processedAt", "$createdAt"] },
+      },
+    },
+
+    // ── Sort by recency (processedAt → createdAt), tie-break by _id ──
+    { $sort: { _sortTs: -1, _id: -1 } },
+
     {
       $lookup: {
         from: "customers",
@@ -1654,6 +1882,7 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
     },
     { $unwind: { path: "$customerDetails", preserveNullAndEmptyArrays: true } },
     { $unwind: { path: "$bookings", preserveNullAndEmptyArrays: true } },
+
     {
       $lookup: {
         from: "actionbookings",
@@ -1663,6 +1892,24 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
       },
     },
     { $unwind: { path: "$actionBookingDetails", preserveNullAndEmptyArrays: true } },
+
+    // ── Normalize booking category (Accommodation / Food / Rental / Service / Other) ──
+    {
+      $addFields: {
+        _bookingCategory: {
+          $switch: {
+            branches: [
+              { case: { $eq: ["$bookings.bookingItemModel", "Accommodation"] }, then: "Accommodation" },
+              { case: { $eq: ["$bookings.bookingItemModel", "Food"] }, then: "Food" },
+              { case: { $eq: ["$bookings.bookingItemModel", "Rental"] }, then: "Rental" },
+              { case: { $eq: ["$bookings.bookingItemModel", "Service"] }, then: "Service" },
+            ],
+            default: { $ifNull: ["$bookings.bookingItemModel", "Other"] },
+          },
+        },
+      },
+    },
+
     {
       $group: {
         _id: "$_id",
@@ -1678,11 +1925,13 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
         refund: { $first: "$refund" },
         createdAt: { $first: "$createdAt" },
         updatedAt: { $first: "$updatedAt" },
+        _sortTs: { $first: "$_sortTs" },
         bookings: {
           $push: {
             $mergeObjects: [
               "$bookings",
               {
+                _category: "$_bookingCategory",
                 customerInfo: {
                   _id: "$customerDetails._id",
                   first_name: "$customerDetails.first_name",
@@ -1713,9 +1962,14 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
         },
       },
     },
+
+    // ── Re-sort AFTER group (group can scramble order) ──
+    { $sort: { _sortTs: -1, _id: -1 } },
+
     {
       $project: {
         _id: 1,
+        _sortTs: 1,
         transactionId: 1,
         customerId: 1,
         customer: {
@@ -1750,6 +2004,7 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
             as: "booking",
             in: {
               _id: "$$booking._id",
+              category: "$$booking._category",
               type: "$$booking.type",
               status: "$$booking.status",
               amount: "$$booking.amount",
@@ -1809,9 +2064,37 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
 
   const result = await paginatedAggregate(BillingHistory, pipeline, pagination);
 
-  const body = paginatedResponse(result);
-  body.message = result.data.length
-    ? `Successfully retrieved ${result.data.length} full payments`
+  // ── JS post-processing: mark the latest row per category ──
+  // Because the pipeline is globally sorted by recency, the FIRST
+  // occurrence of each category in the page is the latest for that category
+  // (relative to the current page). If you want true global-latest-per-category,
+  // see the note below.
+  const seenCategories = new Set();
+  const dataWithLatestFlags = (result.data || []).map((billing) => {
+    const bookings = billing.bookings || [];
+    const categoriesMeta = bookings.map((b) => {
+      const cat = b.category || "Other";
+      const isLatest = !seenCategories.has(cat);
+      if (isLatest) seenCategories.add(cat);
+      return { category: cat, isLatest };
+    });
+
+    // Attach flag to each booking for easy frontend consumption
+    const bookingsWithFlags = bookings.map((b, idx) => ({
+      ...b,
+      isLatestInCategory: categoriesMeta[idx]?.isLatest ?? false,
+    }));
+
+    return {
+      ...billing,
+      bookings: bookingsWithFlags,
+      _latestByCategory: categoriesMeta,
+    };
+  });
+
+  const body = paginatedResponse({ ...result, data: dataWithLatestFlags });
+  body.message = dataWithLatestFlags.length
+    ? `Successfully retrieved ${dataWithLatestFlags.length} full payments`
     : "No full payments found";
 
   if (role === "customer" && customerActionBookings.length > 0) {
@@ -1832,9 +2115,6 @@ exports.getFullPayments = AsyncErrorHandler(async (req, res) => {
 
   res.status(200).json(body);
 });
-
-// ==================== GET VERIFY PAYMENTS (PAGINATED) ====================
-
 exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
   const role = req.user?.role;
   const userId = req.user?.linkId;
@@ -1864,7 +2144,17 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
 
   const pipeline = [
     { $match: { $and: and } },
-    { $sort: { "paymentDetails.processedAt": -1 } },
+
+    // ── Compute a robust sort timestamp (fallback: createdAt) ──
+    {
+      $addFields: {
+        _sortTs: { $ifNull: ["$paymentDetails.processedAt", "$createdAt"] },
+      },
+    },
+
+    // ── Sort by recency (processedAt → createdAt), tie-break by _id ──
+    { $sort: { _sortTs: -1, _id: -1 } },
+
     {
       $lookup: {
         from: "customers",
@@ -1874,6 +2164,7 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
       },
     },
     { $unwind: { path: "$customerDetails", preserveNullAndEmptyArrays: true } },
+
     {
       $addFields: {
         customer: {
@@ -1901,6 +2192,18 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
               $mergeObjects: [
                 "$$booking",
                 {
+                  // ── Normalize booking category ──
+                  category: {
+                    $switch: {
+                      branches: [
+                        { case: { $eq: ["$$booking.bookingItemModel", "Accommodation"] }, then: "Accommodation" },
+                        { case: { $eq: ["$$booking.bookingItemModel", "Food"] }, then: "Food" },
+                        { case: { $eq: ["$$booking.bookingItemModel", "Rental"] }, then: "Rental" },
+                        { case: { $eq: ["$$booking.bookingItemModel", "Service"] }, then: "Service" },
+                      ],
+                      default: { $ifNull: ["$$booking.bookingItemModel", "Other"] },
+                    },
+                  },
                   customer: {
                     _id: "$customerDetails._id",
                     first_name: "$customerDetails.first_name",
@@ -1924,10 +2227,65 @@ exports.getVerifyPayments = AsyncErrorHandler(async (req, res) => {
   ];
 
   const result = await paginatedAggregate(BillingHistory, pipeline, pagination);
-  const body = paginatedResponse(result);
-  body.message = result.data.length
-    ? `Successfully retrieved ${result.data.length} pending verify payments`
+
+  // ── JS post-processing: mark the latest row per category ──
+  // The pipeline is globally sorted by recency, so the FIRST occurrence
+  // of each category on this page is the latest for that category (page-scoped).
+  const seenCategories = new Set();
+  const dataWithLatestFlags = (result.data || []).map((billing) => {
+    const bookings = billing.bookings || [];
+    const categoriesMeta = bookings.map((b) => {
+      const cat = b.category || "Other";
+      const isLatest = !seenCategories.has(cat);
+      if (isLatest) seenCategories.add(cat);
+      return { category: cat, isLatest };
+    });
+
+    const bookingsWithFlags = bookings.map((b, idx) => ({
+      ...b,
+      isLatestInCategory: categoriesMeta[idx]?.isLatest ?? false,
+    }));
+
+        (async () => {
+      try {
+        const viewersList = await getStaffViewers();
+        const newNotification = await Notification.create({
+          message: `New ${
+            paymentDetails.paymentType
+          } billing: ${billingHistory.transactionId} (₱${paymentDetails.paymentAmount.toFixed(
+            2
+          )}) - ${billingStatus}`,
+          FileId: billingHistory._id,
+          viewers: viewersList,
+        });
+        if (io) {
+          const notifPayload = {
+            _id: newNotification._id,
+            message: newNotification.message,
+            FileId: newNotification.FileId,
+            viewers: newNotification.viewers,
+            createdAt: newNotification.createdAt,
+          };
+          io.to("admin").emit("newNotification", notifPayload);
+          io.to("finance").emit("newNotification", notifPayload);
+        }
+      } catch (e) {
+        console.error("⚠️ notif:", e.message);
+      }
+    })();
+
+    return {
+      ...billing,
+      bookings: bookingsWithFlags,
+      _latestByCategory: categoriesMeta,
+    };
+  });
+
+  const body = paginatedResponse({ ...result, data: dataWithLatestFlags });
+  body.message = dataWithLatestFlags.length
+    ? `Successfully retrieved ${dataWithLatestFlags.length} pending verify payments`
     : "No pending verify payments found";
+
   res.status(200).json(body);
 });
 
@@ -2332,23 +2690,103 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
       { new: true, runValidators: true }
     );
 
+    // ============================================================
+    // ✅ FIXED: Per Booking Type logic
+    //    - Rental/Service + Fully Paid → status: "Paid" ✅
+    //    - Accommodation + Fully Paid → status unchanged (CheckIn, etc.) ⛔
+    // ============================================================
     if (isFullyPaid) {
-      const bookingIds = updatedBilling.bookings.map((booking) => booking._id).filter((id) => id);
+      const bookingIds = updatedBilling.bookings
+        .map((booking) => booking._id)
+        .filter((id) => id);
 
       if (bookingIds.length > 0) {
-        actionbooking
-          .updateMany(
-            { _id: { $in: bookingIds } },
-            { $set: { status: "Paid", paymentStatus: "completed", updatedAt: new Date() } }
-          )
-          .catch((e) => console.error("⚠️ actionbooking update:", e.message));
+        // ✅ Determine kung alin sa mga booking ay Rental/Service
+        //    (hindi Accommodation)
+        const nonAccommodationBookings = updatedBilling.bookings.filter(
+          (b) => b.bookingItemModel && b.bookingItemModel !== "Accommodation"
+        );
+        const nonAccommodationIds = nonAccommodationBookings
+          .map((b) => b._id)
+          .filter(Boolean);
 
-        orders
-          .updateMany(
-            { _id: { $in: bookingIds } },
-            { $set: { status: "Paid", paymentStatus: "completed", updatedAt: new Date() } }
-          )
-          .catch((e) => console.error("⚠️ orders update:", e.message));
+        // ✅ Accommodation bookings (status should remain)
+        const accommodationBookings = updatedBilling.bookings.filter(
+          (b) => b.bookingItemModel === "Accommodation"
+        );
+        const accommodationIds = accommodationBookings
+          .map((b) => b._id)
+          .filter(Boolean);
+
+        // ============================================================
+        // ✅ 1. Rental/Service — set status: "Paid"
+        // ============================================================
+        if (nonAccommodationIds.length > 0) {
+          actionbooking
+            .updateMany(
+              { _id: { $in: nonAccommodationIds } },
+              {
+                $set: {
+                  status: "Paid",
+                  paymentStatus: "completed",
+                  updatedAt: new Date(),
+                },
+              }
+            )
+            .catch((e) => console.error("⚠️ actionbooking rental/service update:", e.message));
+
+          orders
+            .updateMany(
+              { _id: { $in: nonAccommodationIds } },
+              {
+                $set: {
+                  status: "Paid",
+                  paymentStatus: "completed",
+                  updatedAt: new Date(),
+                },
+              }
+            )
+            .catch((e) => console.error("⚠️ orders rental/service update:", e.message));
+
+          console.log(
+            `✅ [Rental/Service] Updated ${nonAccommodationIds.length} booking(s) to "Paid"`
+          );
+        }
+
+        // ============================================================
+        // ✅ 2. Accommodation — only paymentStatus, NOT status
+        // ============================================================
+        if (accommodationIds.length > 0) {
+          actionbooking
+            .updateMany(
+              { _id: { $in: accommodationIds } },
+              {
+                $set: {
+                  paymentStatus: "completed",
+                  updatedAt: new Date(),
+                  // ⛔ status remains (CheckIn, CheckedOut, etc.)
+                },
+              }
+            )
+            .catch((e) => console.error("⚠️ actionbooking accommodation update:", e.message));
+
+          orders
+            .updateMany(
+              { _id: { $in: accommodationIds } },
+              {
+                $set: {
+                  paymentStatus: "completed",
+                  updatedAt: new Date(),
+                  // ⛔ status remains (CheckIn, CheckedOut, etc.)
+                },
+              }
+            )
+            .catch((e) => console.error("⚠️ orders accommodation update:", e.message));
+
+          console.log(
+            `✅ [Accommodation] Updated ${accommodationIds.length} booking(s) — paymentStatus only`
+          );
+        }
       }
     }
 
@@ -2445,18 +2883,6 @@ exports.updatePaymentStatus = AsyncErrorHandler(async (req, res) => {
   }
 });
 
-// ==================== ANALYTICS: GRAPH 1 — ACCOMMODATION ====================
-
-/**
- * GET /api/billing/analytics/accommodation
- * Query: ?range=7d|30d|90d|1y  OR  ?startDate=&endDate=
- *        ?groupBy=day|week|month
- *
- * Returns:
- *  - summary          : total value, total bookings, total paid, total balance
- *  - trend[]          : per-period booking count + value (line chart)
- *  - byAccommodation[]: per-item booking count + value — MAY bookingItemModel
- */
 exports.getAccommodationGraph = AsyncErrorHandler(async (req, res) => {
   const { start, end } = buildAnalyticsDateRange(req.query);
   const groupBy = req.query.groupBy || "day";
@@ -2544,7 +2970,7 @@ exports.getAccommodationGraph = AsyncErrorHandler(async (req, res) => {
     { $sort: { bookingCount: -1 } },
   ]);
 
-  console.log("byAccommodation",byAccommodation)
+  console.log("byAccommodation", byAccommodation)
 
   const summary = {
     totalBookings: byAccommodation.reduce((s, a) => s + a.bookingCount, 0),
@@ -2570,18 +2996,6 @@ exports.getAccommodationGraph = AsyncErrorHandler(async (req, res) => {
   });
 });
 
-// ==================== ANALYTICS: GRAPH 2 — FOOD ====================
-
-/**
- * GET /api/billing/analytics/food
- * Query: ?range=7d|30d|90d|1y  OR  ?startDate=&endDate=
- *        ?groupBy=day|week|month
- *
- * Returns:
- *  - summary     : total value, total orders, total items sold, total paid, total balance
- *  - trend[]     : per-period order count + quantity + value (line chart)
- *  - byFoodItem[]: per-item times ordered + quantity + value — MAY bookingItemModel
- */
 exports.getFoodGraph = AsyncErrorHandler(async (req, res) => {
   const { start, end } = buildAnalyticsDateRange(req.query);
   const groupBy = req.query.groupBy || "day";
@@ -2718,4 +3132,339 @@ exports.getFoodGraph = AsyncErrorHandler(async (req, res) => {
     trend,
     byFoodItem,
   });
+});
+
+exports.getCustomersWithHistory = AsyncErrorHandler(async (req, res) => {
+    const role = req.user?.role;
+
+    if (!role) {
+        return res.status(401).json({
+            success: false,
+            message: "Unauthorized: User role not found",
+        });
+    }
+
+    if (role === "customer") {
+        return res.status(403).json({
+            success: false,
+            message: "Forbidden: Customers cannot access this endpoint",
+        });
+    }
+
+    const {
+        search = "",
+        sortBy = "name",
+        sortOrder = "asc",
+    } = req.query;
+
+    // ==================== AGGREGATION ====================
+    const pipeline = [
+        // ✅ Match lang ang may customerId
+        { $match: { customerId: { $ne: null } } },
+
+        // ✅ Unwind bookings — isa-isa
+        { $unwind: { path: "$bookings", preserveNullAndEmptyArrays: true } },
+
+        // ✅ GROUP BY customerId — isang document per customer
+        {
+            $group: {
+                _id: "$customerId",
+
+                // Sorting-only (hindi isasama sa final response)
+                totalSpent: {
+                    $sum: { $ifNull: ["$bookings.paymentAmount", 0] },
+                },
+                bookingsCount: { $sum: 1 },
+
+                // ✅ Accommodations — names lang
+                accommodations: {
+                    $push: {
+                        $cond: [
+                            {
+                                $or: [
+                                    { $eq: ["$bookings.bookingItemModel", "Accommodation"] },
+                                    { $ne: [{ $ifNull: ["$bookings.accommodationType", null] }, null] },
+                                ],
+                            },
+                            {
+                                $ifNull: [
+                                    "$bookings.itemName",
+                                    "$bookings.origin.accommodationName",
+                                    "$bookings.title",
+                                    "Unknown Accommodation",
+                                ],
+                            },
+                            "$$REMOVE",
+                        ],
+                    },
+                },
+
+                // ✅ Rentals — names lang
+                rentals: {
+                    $push: {
+                        $cond: [
+                            {
+                                $or: [
+                                    { $eq: ["$bookings.bookingItemModel", "Rental"] },
+                                    { $ne: [{ $ifNull: ["$bookings.rentalUnit", null] }, null] },
+                                ],
+                            },
+                            {
+                                $ifNull: [
+                                    "$bookings.itemName",
+                                    "$bookings.title",
+                                    "Unknown Rental",
+                                ],
+                            },
+                            "$$REMOVE",
+                        ],
+                    },
+                },
+
+                // ✅ Services — names lang
+                services: {
+                    $push: {
+                        $cond: [
+                            {
+                                $or: [
+                                    { $eq: ["$bookings.bookingItemModel", "Service"] },
+                                    { $ne: [{ $ifNull: ["$bookings.serviceCategory", null] }, null] },
+                                ],
+                            },
+                            {
+                                $ifNull: [
+                                    "$bookings.itemName",
+                                    "$bookings.title",
+                                    "Unknown Service",
+                                ],
+                            },
+                            "$$REMOVE",
+                        ],
+                    },
+                },
+
+                // ✅ Food — names lang
+                food: {
+                    $push: {
+                        $cond: [
+                            {
+                                $and: [
+                                    { $eq: ["$bookings.type", "Order"] },
+                                    { $ne: [{ $size: { $ifNull: ["$bookings.items", []] } }, 0] },
+                                ],
+                            },
+                            {
+                                $map: {
+                                    input: { $ifNull: ["$bookings.items", []] },
+                                    as: "item",
+                                    in: "$$item.name",
+                                },
+                            },
+                            "$$REMOVE",
+                        ],
+                    },
+                },
+            },
+        },
+
+        // ✅ Lookup customer details (name lang kailangan)
+        {
+            $lookup: {
+                from: "customers",
+                localField: "_id",
+                foreignField: "_id",
+                as: "customerDoc",
+            },
+        },
+        {
+            $unwind: {
+                path: "$customerDoc",
+                preserveNullAndEmptyArrays: true,
+            },
+        },
+
+        // ✅ Project — customerId, customerName, categories (trim + dedupe)
+        {
+            $project: {
+                _id: 0,
+                customerId: "$_id",
+                customerName: {
+                    $trim: {
+                        input: {
+                            $concat: [
+                                { $ifNull: ["$customerDoc.first_name", ""] },
+                                " ",
+                                { $ifNull: ["$customerDoc.middle_name", ""] },
+                                " ",
+                                { $ifNull: ["$customerDoc.last_name", ""] },
+                                " ",
+                                { $ifNull: ["$customerDoc.suffix", ""] },
+                            ],
+                        },
+                    },
+                },
+
+                // ✅ Accommodations — trim + dedupe
+                accommodations: {
+                    $reduce: {
+                        input: {
+                            $map: {
+                                input: "$accommodations",
+                                as: "name",
+                                in: { $trim: { input: "$$name" } },
+                            },
+                        },
+                        initialValue: [],
+                        in: {
+                            $cond: [
+                                { $in: ["$$this", "$$value"] },
+                                "$$value",
+                                { $concatArrays: ["$$value", ["$$this"]] },
+                            ],
+                        },
+                    },
+                },
+
+                // ✅ Rentals — trim + dedupe
+                rentals: {
+                    $reduce: {
+                        input: {
+                            $map: {
+                                input: "$rentals",
+                                as: "name",
+                                in: { $trim: { input: "$$name" } },
+                            },
+                        },
+                        initialValue: [],
+                        in: {
+                            $cond: [
+                                { $in: ["$$this", "$$value"] },
+                                "$$value",
+                                { $concatArrays: ["$$value", ["$$this"]] },
+                            ],
+                        },
+                    },
+                },
+
+                // ✅ Services — trim + dedupe
+                services: {
+                    $reduce: {
+                        input: {
+                            $map: {
+                                input: "$services",
+                                as: "name",
+                                in: { $trim: { input: "$$name" } },
+                            },
+                        },
+                        initialValue: [],
+                        in: {
+                            $cond: [
+                                { $in: ["$$this", "$$value"] },
+                                "$$value",
+                                { $concatArrays: ["$$value", ["$$this"]] },
+                            ],
+                        },
+                    },
+                },
+
+                // ✅ Food — trim + flatten + dedupe
+                food: {
+                    $reduce: {
+                        input: {
+                            $map: {
+                                input: "$food",
+                                as: "arr",
+                                in: {
+                                    $map: {
+                                        input: "$$arr",
+                                        as: "name",
+                                        in: { $trim: { input: "$$name" } },
+                                    },
+                                },
+                            },
+                        },
+                        initialValue: [],
+                        in: {
+                            $reduce: {
+                                input: "$$this",
+                                initialValue: "$$value",
+                                in: {
+                                    $cond: [
+                                        { $in: ["$$this", "$$value"] },
+                                        "$$value",
+                                        { $concatArrays: ["$$value", ["$$this"]] },
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+
+                // ✅ Sorting-only — hindi lalabas sa final response
+                totalSpent: 1,
+                bookingsCount: 1,
+            },
+        },
+
+        // ✅ Fallback name
+        {
+            $addFields: {
+                customerName: {
+                    $cond: [
+                        { $eq: [{ $trim: { input: "$customerName" } }, ""] },
+                        "Walk-in Guest",
+                        "$customerName",
+                    ],
+                },
+            },
+        },
+
+        // ✅ SEARCH — sa name, categories
+        ...(search && search.trim() !== ""
+            ? [
+                  {
+                      $match: {
+                          $or: [
+                              { customerName: { $regex: search.trim(), $options: "i" } },
+                              { accommodations: { $regex: search.trim(), $options: "i" } },
+                              { rentals: { $regex: search.trim(), $options: "i" } },
+                              { services: { $regex: search.trim(), $options: "i" } },
+                              { food: { $regex: search.trim(), $options: "i" } },
+                          ],
+                      },
+                  },
+              ]
+            : []),
+
+        // ✅ SORT
+        {
+            $sort:
+                sortBy === "totalSpent"
+                    ? { totalSpent: sortOrder === "desc" ? -1 : 1 }
+                    : sortBy === "totalBookings"
+                    ? { bookingsCount: sortOrder === "desc" ? -1 : 1 }
+                    : sortBy === "created_at"
+                    ? { customerId: sortOrder === "desc" ? -1 : 1 }
+                    : { customerName: sortOrder === "desc" ? -1 : 1 },
+        },
+
+        // ✅ Alisin ang sorting-only fields
+        {
+            $project: {
+                totalSpent: 0,
+                bookingsCount: 0,
+            },
+        },
+    ];
+
+    // ✅ No skip, no limit — kunin lahat
+    const data = await BillingHistory.aggregate(pipeline);
+
+    res.status(200).json({
+        success: true,
+        data,
+        count: data.length,
+        appliedSearch: search.trim() || null,
+        appliedSort: { sortBy, sortOrder },
+    });
 });

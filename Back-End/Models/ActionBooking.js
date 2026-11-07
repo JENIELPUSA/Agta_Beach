@@ -79,7 +79,10 @@ const ActionBookingSchema = new mongoose.Schema({
     required: true,
     refPath: "bookingItemModel",
   },
-
+  actualNumberGuest: {
+    type: Number,
+    default: 0,
+  },
   bookingItemModel: {
     type: String,
     required: true,
@@ -112,6 +115,21 @@ const ActionBookingSchema = new mongoose.Schema({
   },
 
   checkOut: {
+    type: Date,
+    default: null,
+  },
+
+  // ============================================================
+  // ✅ BAGONG FIELDS: Actual Check-In / Check-Out Time
+  //    - checkInTime: timestamp kapag nag-CheckIn
+  //    - checkOutTime: timestamp kapag nag-CheckedOut
+  // ============================================================
+  checkInTime: {
+    type: Date,
+    default: null,
+  },
+
+  checkOutTime: {
     type: Date,
     default: null,
   },
@@ -169,6 +187,38 @@ const autoTrackStatus = (doc, newStatus, changedBy = null, notes = "") => {
   });
 };
 
+// ==================== ✅ HELPER: Auto-Set Check-In / Check-Out Time ====================
+
+/**
+ * Awtomatikong nagseset ng timestamp sa checkInTime / checkOutTime
+ * base sa status change.
+ *
+ * @param {Object} doc - ActionBooking document
+ * @param {String} newStatus - Bagong status (CheckIn, CheckedOut, etc.)
+ * @param {String} prevStatus - Dating status (para ma-detect kung nagbago)
+ */
+const autoSetCheckInOutTime = (doc, newStatus, prevStatus = null) => {
+  // ✅ CHECK-IN TIME — kapag nag-change to "CheckIn"
+  if (newStatus === "CheckIn" && prevStatus !== "CheckIn") {
+    if (!doc.checkInTime) {
+      doc.checkInTime = new Date();
+      console.log(
+        `✅ [ActionBooking] checkInTime set to ${doc.checkInTime.toISOString()} for ${doc.bookingNumber}`
+      );
+    }
+  }
+
+  // ✅ CHECK-OUT TIME — kapag nag-change to "CheckedOut"
+  if (newStatus === "CheckedOut" && prevStatus !== "CheckedOut") {
+    if (!doc.checkOutTime) {
+      doc.checkOutTime = new Date();
+      console.log(
+        `✅ [ActionBooking] checkOutTime set to ${doc.checkOutTime.toISOString()} for ${doc.bookingNumber}`
+      );
+    }
+  }
+};
+
 // ==================== PRE-VALIDATE HOOK ====================
 
 ActionBookingSchema.pre("validate", function (next) {
@@ -213,6 +263,20 @@ ActionBookingSchema.pre("save", async function (next) {
         this.approverId,
         `Status changed to ${this.status}`
       );
+    }
+
+    // ============================================================
+    // ✅ AUTO-SET CHECK-IN / CHECK-OUT TIME
+    //    Base sa status change
+    // ============================================================
+    if (this.isNew) {
+      // ✅ Bagong document — i-check kung CheckIn/CheckedOut agad
+      autoSetCheckInOutTime(this, this.status, null);
+    } else if (this.isModified("status")) {
+      // ✅ Existing document — i-check ang dating status
+      //    Para ma-detect kung nag-change to CheckIn/CheckedOut
+      const prevStatus = this.$__.priorDoc?.status || null;
+      autoSetCheckInOutTime(this, this.status, prevStatus);
     }
 
     if (!this.isNew && !this.isModified("customerId") && !this.isModified("bookingItemId")) {
@@ -401,6 +465,30 @@ ActionBookingSchema.pre("findOneAndUpdate", async function (next) {
           if (!update.$push) update.$push = {};
           update.$push.statusTracking = trackingEntry;
         }
+
+        // ============================================================
+        // ✅ AUTO-SET CHECK-IN / CHECK-OUT TIME
+        //    Base sa status change (findOneAndUpdate)
+        // ============================================================
+        if (newStatus === "CheckIn" && currentDoc.status !== "CheckIn") {
+          if (!update.$set) update.$set = {};
+          if (!update.$set.checkInTime) {
+            update.$set.checkInTime = new Date();
+            console.log(
+              `✅ [findOneAndUpdate] checkInTime set for status change to CheckIn`
+            );
+          }
+        }
+
+        if (newStatus === "CheckedOut" && currentDoc.status !== "CheckedOut") {
+          if (!update.$set) update.$set = {};
+          if (!update.$set.checkOutTime) {
+            update.$set.checkOutTime = new Date();
+            console.log(
+              `✅ [findOneAndUpdate] checkOutTime set for status change to CheckedOut`
+            );
+          }
+        }
       }
     }
 
@@ -531,6 +619,7 @@ ActionBookingSchema.statics.checkDuplicate = async function (customerId, booking
 
 /**
  * I-update ang status at awtomatikong mag-log sa statusTracking.
+ * ✅ Auto-set din ng checkInTime / checkOutTime.
  */
 ActionBookingSchema.statics.updateStatusWithTracking = async function (
   bookingId,
@@ -544,11 +633,31 @@ ActionBookingSchema.statics.updateStatusWithTracking = async function (
       throw new Error("Booking not found");
     }
 
+    const prevStatus = booking.status;
     booking.status = newStatus;
 
     if (TRACKABLE_STATUSES.includes(newStatus)) {
       booking.approverId = changedBy || booking.approverId;
       // Ang pre-save hook ay mag-a-add ng tracking entry
+    }
+
+    // ✅ AUTO-SET CHECK-IN / CHECK-OUT TIME
+    if (newStatus === "CheckIn" && prevStatus !== "CheckIn") {
+      if (!booking.checkInTime) {
+        booking.checkInTime = new Date();
+        console.log(
+          `✅ [updateStatusWithTracking] checkInTime set for ${booking.bookingNumber}`
+        );
+      }
+    }
+
+    if (newStatus === "CheckedOut" && prevStatus !== "CheckedOut") {
+      if (!booking.checkOutTime) {
+        booking.checkOutTime = new Date();
+        console.log(
+          `✅ [updateStatusWithTracking] checkOutTime set for ${booking.bookingNumber}`
+        );
+      }
     }
 
     await booking.save();

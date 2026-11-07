@@ -4,6 +4,7 @@ const UserLoginSchema = require("../Models/LogInDentalSchema");
 const Order = require("../Models/OrderSchema");
 const ActionBooking = require("../Models/ActionBooking");
 const Customer = require("../Models/CustomerSchema");
+const HistorySchema= require("../Models/BillingHistorySchema")
 const mongoose = require("mongoose");
 
 // =====================================
@@ -68,9 +69,6 @@ const computeTotalPrice = (unitPrice, expectedStay, bookingItemModel) => {
   return unitPrice;
 };
 
-// =====================================
-// GET MY BILLING
-// =====================================
 exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   const userId = req.user?._id;
   const role = req.user?.role;
@@ -1293,768 +1291,46 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
 // GET ALL BOOKINGS
 // =====================================
 exports.getAllBookings = AsyncErrorHandler(async (req, res) => {
-  const { dateFrom, dateTo, page = 1, limit = 10, search } = req.query;
-
-  const role = req.user?.role;
-
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  const pageSize = parseInt(limit);
-
-  // =========================
-  // 1. DYNAMIC FILTER OBJECT
-  // =========================
-  let filter = {};
-
-  if (dateFrom || dateTo) {
-    filter.created_at = {};
-    if (dateFrom) filter.created_at.$gte = new Date(dateFrom);
-    if (dateTo) {
-      const endOfDay = new Date(dateTo);
-      endOfDay.setHours(23, 59, 59, 999);
-      filter.created_at.$lte = endOfDay;
-    }
-  }
-
-  // SEARCH FILTER
-  if (search && search.trim() !== "") {
-    filter.$or = [
-      { bookingNumber: { $regex: search, $options: "i" } },
-      { status: { $regex: search, $options: "i" } },
-      { bookingItemModel: { $regex: search, $options: "i" } },
-    ];
-  }
-
-  // =========================
-  // 2. AGGREGATION
-  // =========================
-  const results = await ActionBooking.aggregate([
-    { $match: filter },
-    { $sort: { created_at: -1 } },
-
-    // CUSTOMER USER
-    {
-      $lookup: {
-        from: "userloginschemas",
-        localField: "customerId",
-        foreignField: "_id",
-        as: "customerUser",
-      },
-    },
-    { $unwind: { path: "$customerUser", preserveNullAndEmptyArrays: true } },
-
-    {
-      $lookup: {
-        from: "customers",
-        localField: "customerUser.linkedId",
-        foreignField: "_id",
-        as: "customer",
-      },
-    },
-    { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
-
-    // ACCOMMODATION
-    {
-      $lookup: {
-        from: "accommodations",
-        let: { id: "$bookingItemId", model: "$bookingItemModel" },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ["$_id", "$$id"] },
-                  { $eq: ["$$model", "Accommodation"] },
-                ],
-              },
-            },
-          },
-        ],
-        as: "accommodation",
-      },
-    },
-
-    // SERVICE
-    {
-      $lookup: {
-        from: "services",
-        let: { id: "$bookingItemId", model: "$bookingItemModel" },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ["$_id", "$$id"] },
-                  { $eq: ["$$model", "Service"] },
-                ],
-              },
-            },
-          },
-        ],
-        as: "service",
-      },
-    },
-
-    // ACTIVITY
-    {
-      $lookup: {
-        from: "activities",
-        let: { id: "$bookingItemId", model: "$bookingItemModel" },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ["$_id", "$$id"] },
-                  { $eq: ["$$model", "Activity"] },
-                ],
-              },
-            },
-          },
-        ],
-        as: "activity",
-      },
-    },
-
-    // RENTAL
-    {
-      $lookup: {
-        from: "rentals",
-        let: { id: "$bookingItemId", model: "$bookingItemModel" },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ["$_id", "$$id"] },
-                  { $eq: ["$$model", "Rental"] },
-                ],
-              },
-            },
-          },
-        ],
-        as: "rental",
-      },
-    },
-
-    // MERGE BOOKING ITEM
-    {
-      $addFields: {
-        bookingItem: {
-          $switch: {
-            branches: [
-              {
-                case: { $eq: ["$bookingItemModel", "Accommodation"] },
-                then: { $arrayElemAt: ["$accommodation", 0] },
-              },
-              {
-                case: { $eq: ["$bookingItemModel", "Service"] },
-                then: { $arrayElemAt: ["$service", 0] },
-              },
-              {
-                case: { $eq: ["$bookingItemModel", "Activity"] },
-                then: { $arrayElemAt: ["$activity", 0] },
-              },
-              {
-                case: { $eq: ["$bookingItemModel", "Rental"] },
-                then: { $arrayElemAt: ["$rental", 0] },
-              },
-            ],
-            default: null,
-          },
-        },
-      },
-    },
-
-    // =========================
-    // 3. LOOKUP BILLING HISTORY
-    // =========================
-    {
-      $lookup: {
-        from: "billinghistories",
-        let: {
-          bookingRef: "$bookingNumber",
-          bookingId: "$_id",
-        },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $or: [
-                  { $eq: ["$bookings.bookingNumber", "$$bookingRef"] },
-                  { $eq: ["$bookings._id", "$$bookingId"] },
-                  { $in: ["$$bookingRef", "$bookings.bookingNumber"] },
-                ],
-              },
-            },
-          },
-          {
-            $addFields: {
-              matchingBooking: {
-                $arrayElemAt: [
-                  {
-                    $filter: {
-                      input: "$bookings",
-                      as: "b",
-                      cond: {
-                        $or: [
-                          { $eq: ["$$b.bookingNumber", "$$bookingRef"] },
-                          { $eq: ["$$b._id", "$$bookingId"] },
-                        ],
-                      },
-                    },
-                  },
-                  0,
-                ],
-              },
-            },
-          },
-          {
-            $match: {
-              matchingBooking: { $ne: null },
-            },
-          },
-          {
-            $sort: { createdAt: -1 },
-          },
-          {
-            $project: {
-              _id: 0,
-              transactionId: 1,
-              status: 1,
-              paymentDetails: 1,
-              "matchingBooking.paymentStatus": 1,
-              "matchingBooking.paymentAmount": 1,
-              "matchingBooking.remainingBalance": 1,
-              createdAt: 1,
-              updatedAt: 1,
-            },
-          },
-        ],
-        as: "billingHistory",
-      },
-    },
-
-    // =========================
-    // 4. PROCESS BILLING DATA
-    // =========================
-    {
-      $addFields: {
-        latestBilling: { $arrayElemAt: ["$billingHistory", 0] },
-        allBilling: "$billingHistory",
-        hasBilling: { $gt: [{ $size: "$billingHistory" }, 0] },
-
-        paymentStatus: {
-          $cond: {
-            if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: {
-              $switch: {
-                branches: [
-                  {
-                    case: { $eq: ["$latestBilling.status", "fully_paid"] },
-                    then: "fully_paid",
-                  },
-                  {
-                    case: { $eq: ["$latestBilling.status", "partial"] },
-                    then: "partial",
-                  },
-                  {
-                    case: {
-                      $and: [
-                        {
-                          $eq: [
-                            "$latestBilling.paymentDetails.paymentType",
-                            "full",
-                          ],
-                        },
-                        { $eq: ["$latestBilling.status", "completed"] },
-                      ],
-                    },
-                    then: "fully_paid",
-                  },
-                ],
-                default: "unpaid",
-              },
-            },
-            else: "unpaid",
-          },
-        },
-
-        totalPaidAmount: {
-          $cond: {
-            if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: { $sum: "$billingHistory.paymentDetails.paymentAmount" },
-            else: 0,
-          },
-        },
-
-        bookingPaymentAmount: {
-          $cond: {
-            if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: "$latestBilling.matchingBooking.paymentAmount",
-            else: 0,
-          },
-        },
-
-        remainingBalance: {
-          $cond: {
-            if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: {
-              $cond: {
-                if: { $eq: ["$latestBilling.status", "partial"] },
-                then: "$latestBilling.matchingBooking.remainingBalance",
-                else: 0,
-              },
-            },
-            else: null,
-          },
-        },
-
-        isFullyPaid: {
-          $cond: {
-            if: { $gt: [{ $size: "$billingHistory" }, 0] },
-            then: {
-              $or: [
-                { $eq: ["$latestBilling.status", "fully_paid"] },
-                { $eq: ["$latestBilling.status", "completed"] },
-                { $eq: ["$latestBilling.paymentDetails.paymentType", "full"] },
-              ],
-            },
-            else: false,
-          },
-        },
-      },
-    },
-
-    // =========================
-    // 5. CALCULATE ADJUSTED AMOUNT
-    // =========================
-    {
-      $addFields: {
-        //  Gamitin ang totalPrice kung mayroon
-        originalAmount: {
-          $cond: {
-            if: { $gt: ["$totalPrice", 0] },
-            then: "$totalPrice",
-            else: "$amount",
-          },
-        },
-
-        adjustedAmount: {
-          $cond: {
-            if: {
-              $and: [
-                { $eq: ["$paymentStatus", "partial"] },
-                { $gt: ["$bookingPaymentAmount", 0] },
-              ],
-            },
-            then: {
-              $subtract: [
-                {
-                  $cond: {
-                    if: { $gt: ["$totalPrice", 0] },
-                    then: "$totalPrice",
-                    else: "$amount",
-                  },
-                },
-                "$bookingPaymentAmount",
-              ],
-            },
-            else: {
-              $cond: {
-                if: { $gt: ["$totalPrice", 0] },
-                then: "$totalPrice",
-                else: "$amount",
-              },
-            },
-          },
-        },
-
-        displayAmount: {
-          $switch: {
-            branches: [
-              {
-                case: { $eq: ["$paymentStatus", "fully_paid"] },
-                then: 0,
-              },
-              {
-                case: { $eq: ["$paymentStatus", "partial"] },
-                then: {
-                  $subtract: [
-                    {
-                      $cond: {
-                        if: { $gt: ["$totalPrice", 0] },
-                        then: "$totalPrice",
-                        else: "$amount",
-                      },
-                    },
-                    "$bookingPaymentAmount",
-                  ],
-                },
-              },
-            ],
-            default: {
-              $cond: {
-                if: { $gt: ["$totalPrice", 0] },
-                then: "$totalPrice",
-                else: "$amount",
-              },
-            },
-          },
-        },
-
-        paymentStatusText: {
-          $switch: {
-            branches: [
-              {
-                case: { $eq: ["$paymentStatus", "fully_paid"] },
-                then: "Fully Paid",
-              },
-              {
-                case: { $eq: ["$paymentStatus", "partial"] },
-                then: "Partially Paid",
-              },
-            ],
-            default: "Unpaid",
-          },
-        },
-
-        paymentCount: { $size: "$billingHistory" },
-      },
-    },
-
-    // =========================
-    // 7. CLEANUP
-    // =========================
-    {
-      $project: {
-        accommodation: 0,
-        service: 0,
-        activity: 0,
-        rental: 0,
-        customerUser: 0,
-        billingHistory: 0,
-        latestBilling: 0,
-        allBilling: 0,
-      },
-    },
-
-    // =========================
-    // 8. PAGINATION (FACET)
-    // =========================
-    {
-      $facet: {
-        metadata: [{ $count: "total" }],
-        data: [{ $skip: skip }, { $limit: pageSize }],
-      },
-    },
-  ]);
-
-  const totalCount = results[0].metadata[0]?.total || 0;
-  const bookings = results[0].data;
-  const totalPages = Math.ceil(totalCount / pageSize);
-
-  res.status(200).json({
-    success: true,
-    totalCount,
-    totalPages,
-    currentPage: parseInt(page),
-    limit: pageSize,
-    data: bookings,
-  });
-});
-
-exports.createBooking = AsyncErrorHandler(async (req, res) => {
   try {
-    const {
-      bookingItemId,
-      bookingItemModel,
-      first_name,
-      last_name,
-      middle_name,
-      suffix,
-      email,
-      password,
-      expected_stay,
-      checkIn,
-      checkOut,
-      userId,
-    } = req.body;
+    const { dateFrom, dateTo, page = 1, limit = 10, search } = req.query;
 
-    const role = req.user.role;
+    const role = req.user?.role;
 
-    let guestUserId = null;
-    let customerId = null;
-    let isWalkin = false;
-    let shouldCreateUser = true;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pageSize = parseInt(limit);
 
-    // =====================================
-    // 1. RECEPTIONIST / ADMIN — WALK-IN
-    // =====================================
-    if (role === "receptionist" || role === "admin") {
-      isWalkin = true;
+    // =========================
+    // 1. DYNAMIC FILTER OBJECT
+    // =========================
+    let filter = {};
 
-      if (bookingItemModel === "Rental" || bookingItemModel === "Service") {
-        shouldCreateUser = false;
-        console.log(
-          `ℹ️ ${bookingItemModel} booking - will create customer only, no user account`
-        );
-      }
-
-      // =====================================
-      // 1A. EXISTING USER (may userId)
-      // =====================================
-      if (userId) {
-        const existingUser = await UserLoginSchema.findById(userId);
-
-        if (existingUser) {
-          console.log(
-            `👤 Using existing user account: ${existingUser.username}`
-          );
-          guestUserId = existingUser._id;
-          customerId = existingUser.linkedId;
-
-          if (first_name || last_name || middle_name || suffix) {
-            await Customer.findByIdAndUpdate(customerId, {
-              first_name: first_name || existingUser.customer?.first_name,
-              last_name: last_name || existingUser.customer?.last_name,
-              middle_name: middle_name || existingUser.customer?.middle_name,
-              suffix: suffix || existingUser.customer?.suffix,
-            });
-          }
-        } else {
-          return res.status(404).json({
-            success: false,
-            message: "User not found with the provided userId",
-          });
-        }
-      }
-
-      // =====================================
-      // 1B. NEW WALK-IN (walang userId)
-      // =====================================
-      else {
-        // -------------------------------------
-        // ✅ VALIDATE email + password (para sa lahat ng bagong walk-in)
-        // -------------------------------------
-        if (!email || !email.trim()) {
-          return res.status(400).json({
-            success: false,
-            message: "Email is required for new walk-in guests.",
-          });
-        }
-        if (!password || password.length < 6) {
-          return res.status(400).json({
-            success: false,
-            message: "Password must be at least 6 characters.",
-          });
-        }
-
-        // Check kung existing na ang email (para sa lahat ng bagong user)
-        const emailExists = await UserLoginSchema.findOne({
-          email: email.toLowerCase().trim(),
-        });
-        if (emailExists) {
-          return res.status(409).json({
-            success: false,
-            message:
-              "Email is already registered. Please use a different email.",
-          });
-        }
-
-        // -------------------------------------
-        // 1B-1. Create Customer profile
-        // -------------------------------------
-        const customer = await Customer.create({
-          first_name: first_name || "",
-          last_name: last_name || "",
-          middle_name: middle_name || "",
-          suffix: suffix || "",
-          email: email.toLowerCase().trim(), // ✅ FIXED: idinagdag ang email value
-          avatar: {
-            url: "",
-            public_id: "",
-          },
-        });
-
-        customerId = customer._id;
-        console.log(
-          `✅ Created customer: ${first_name} ${last_name} (${customerId})`
-        );
-
-        // -------------------------------------
-        // 1B-2. Create UserLogin account
-        // -------------------------------------
-        if (shouldCreateUser) {
-          const existingUser = await UserLoginSchema.findOne({
-            linkedId: customerId,
-          });
-
-          if (!existingUser) {
-            console.log("🔐 Creating UserLoginSchema with:", {
-              email: email.toLowerCase().trim(),
-              username: email.toLowerCase().trim(),
-              role: "customer",
-              linkedId: customerId,
-              passwordLength: password.length,
-            });
-
-            const newUser = await UserLoginSchema.create({
-              first_name: first_name || "",
-              last_name: last_name || "",
-              middle_name: middle_name || "",
-              suffix: suffix || "",
-              email: email.toLowerCase().trim(),
-              password: password,
-              confirmPassword: password,
-              username: email.toLowerCase().trim(),
-              role: "customer",
-              linkedId: customerId,
-              isVerified: true,
-            });
-
-            guestUserId = newUser._id;
-
-            // =====================================
-            // 🔍 VERIFY — i-query pabalik para sigurado
-            // =====================================
-            const verifyUser = await UserLoginSchema.findById(newUser._id)
-              .select("+password")
-              .lean();
-
-            console.log("=".repeat(60));
-            console.log("✅ USER CREATED — VERIFICATION");
-            console.log("=".repeat(60));
-            console.log("📧 email:", verifyUser?.email);
-            console.log("👤 username:", verifyUser?.username);
-            console.log(
-              "🔑 password:",
-              verifyUser?.password
-                ? `✅ HASHED (${verifyUser.password.substring(0, 15)}...)`
-                : "❌ MISSING"
-            );
-            console.log("🎭 role:", verifyUser?.role);
-            console.log("🔗 linkedId:", verifyUser?.linkedId);
-            console.log("✅ isVerified:", verifyUser?.isVerified);
-            console.log("=".repeat(60));
-          } else {
-            console.log(
-              `👤 Guest already has user account: ${existingUser.username}`
-            );
-            guestUserId = existingUser._id;
-          }
-        } else {
-          // Rental / Service — temporary user lang
-          console.log(
-            `ℹ️ No full user account created for ${bookingItemModel} booking`
-          );
-
-          const tempUser = await UserLoginSchema.create({
-            first_name: first_name || "",
-            last_name: last_name || "",
-            email: email.toLowerCase().trim(),
-            username: `${first_name?.toLowerCase() || "guest"}_temp_${Date.now()}`,
-            password: password,
-            confirmPassword: password,
-            role: "customer",
-            linkedId: customerId,
-            isVerified: false,
-          });
-
-          guestUserId = tempUser._id;
-          console.log(
-            `✅ Created temporary user account for ${bookingItemModel} booking (${tempUser._id})`
-          );
-        }
+    if (dateFrom || dateTo) {
+      filter.created_at = {};
+      if (dateFrom) filter.created_at.$gte = new Date(dateFrom);
+      if (dateTo) {
+        const endOfDay = new Date(dateTo);
+        endOfDay.setHours(23, 59, 59, 999);
+        filter.created_at.$lte = endOfDay;
       }
     }
 
-    // =====================================
-    // 2. NON-RECEPTIONIST (regular user)
-    // =====================================
-    else {
-      customerId = req.body.userId || req.body.customerId;
-      isWalkin = false;
-
-      const user = await UserLoginSchema.findById(customerId);
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: "User not found",
-        });
-      }
-      guestUserId = customerId;
+    // SEARCH FILTER
+    if (search && search.trim() !== "") {
+      filter.$or = [
+        { bookingNumber: { $regex: search, $options: "i" } },
+        { status: { $regex: search, $options: "i" } },
+        { bookingItemModel: { $regex: search, $options: "i" } },
+      ];
     }
 
-    // =====================================
-    // 3. DETERMINE BOOKING STATUS
-    // =====================================
-    const bookingStatus = isWalkin ? "Confirmed" : "Pending";
-    console.log(
-      `📌 Booking status set to: ${bookingStatus} (isWalkin: ${isWalkin})`
-    );
+    // =========================
+    // 2. AGGREGATION
+    // =========================
+    const results = await ActionBooking.aggregate([
+      { $match: filter },
+      { $sort: { created_at: -1 } },
 
-    // =====================================
-    // 4. COMPUTE CHECK-IN / CHECK-OUT
-    // =====================================
-    const finalCheckIn = checkIn ? new Date(checkIn) : new Date();
-
-    let finalCheckOut = checkOut ? new Date(checkOut) : null;
-    if (!finalCheckOut && finalCheckIn && expected_stay) {
-      finalCheckOut = new Date(finalCheckIn);
-      finalCheckOut.setDate(
-        finalCheckOut.getDate() + parseInt(expected_stay)
-      );
-    }
-
-    console.log("📍 Final checkIn:", finalCheckIn);
-    console.log("📍 Final checkOut:", finalCheckOut);
-
-    // =====================================
-    // 4.5 COMPUTE UNIT PRICE / WEEKEND / TOTAL
-    // =====================================
-    const unitPrice = await getItemUnitPrice(
-      bookingItemId,
-      bookingItemModel
-    );
-    const isWeekend = isWeekendDate(finalCheckIn);
-    const totalPrice = computeTotalPrice(
-      unitPrice,
-      expected_stay,
-      bookingItemModel
-    );
-
-    console.log("💰 unitPrice:", unitPrice);
-    console.log("💰 isWeekend:", isWeekend);
-    console.log("💰 totalPrice:", totalPrice);
-
-    // =====================================
-    // 5. CREATE BOOKING
-    // =====================================
-    const booking = await ActionBooking.create({
-      customerId: guestUserId,
-      bookingItemId,
-      bookingItemModel,
-      isWalkin: isWalkin,
-      expected_stay: expected_stay || 1,
-      checkIn: finalCheckIn,
-      checkOut: finalCheckOut,
-      status: bookingStatus,
-
-      unitPrice: req.body.unitPrice,
-      isWeekend: req.body.isWeekend,
-      totalPrice: req.body.totalPrice,
-      weekdaysPrice: req.body.weekdaysPrice,
-      weekendPrice: req.body.weekendPrice,
-      weekdaysBreakfastPrice: req.body.weekdaysBreakfastPrice,
-      weekendBreakfastPrice: req.body.weekendBreakfastPrice,
-    });
-
-    // =====================================
-    // 6. AGGREGATION (FULL DETAILS)
-    // =====================================
-    const detailedBookingArray = await ActionBooking.aggregate([
-      { $match: { _id: booking._id } },
-
+      // CUSTOMER USER
       {
         $lookup: {
           from: "userloginschemas",
@@ -2159,7 +1435,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         },
       },
 
-      // MERGE FINAL ITEM
+      // MERGE BOOKING ITEM
       {
         $addFields: {
           bookingItem: {
@@ -2188,6 +1464,771 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         },
       },
 
+      // =========================
+      // 3. LOOKUP BILLING HISTORY
+      // =========================
+      {
+        $lookup: {
+          from: "billinghistories",
+          let: {
+            bookingRef: "$bookingNumber",
+            bookingId: "$_id",
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    { $eq: ["$bookings.bookingNumber", "$$bookingRef"] },
+                    { $eq: ["$bookings._id", "$$bookingId"] },
+                    { $in: ["$$bookingRef", "$bookings.bookingNumber"] },
+                  ],
+                },
+              },
+            },
+            {
+              $addFields: {
+                matchingBooking: {
+                  $arrayElemAt: [
+                    {
+                      $filter: {
+                        input: "$bookings",
+                        as: "b",
+                        cond: {
+                          $or: [
+                            { $eq: ["$$b.bookingNumber", "$$bookingRef"] },
+                            { $eq: ["$$b._id", "$$bookingId"] },
+                          ],
+                        },
+                      },
+                    },
+                    0,
+                  ],
+                },
+              },
+            },
+            {
+              $match: {
+                matchingBooking: { $ne: null },
+              },
+            },
+            {
+              $sort: { createdAt: -1 },
+            },
+            {
+              $project: {
+                _id: 0,
+                transactionId: 1,
+                status: 1,
+                paymentDetails: 1,
+                "matchingBooking.paymentStatus": 1,
+                "matchingBooking.paymentAmount": 1,
+                "matchingBooking.remainingBalance": 1,
+                createdAt: 1,
+                updatedAt: 1,
+              },
+            },
+          ],
+          as: "billingHistory",
+        },
+      },
+
+      // =========================
+      // 4. PROCESS BILLING DATA
+      // =========================
+      {
+        $addFields: {
+          latestBilling: { $arrayElemAt: ["$billingHistory", 0] },
+          allBilling: "$billingHistory",
+          hasBilling: { $gt: [{ $size: "$billingHistory" }, 0] },
+
+          paymentStatus: {
+            $cond: {
+              if: { $gt: [{ $size: "$billingHistory" }, 0] },
+              then: {
+                $switch: {
+                  branches: [
+                    {
+                      case: { $eq: ["$latestBilling.status", "fully_paid"] },
+                      then: "fully_paid",
+                    },
+                    {
+                      case: { $eq: ["$latestBilling.status", "partial"] },
+                      then: "partial",
+                    },
+                    {
+                      case: {
+                        $and: [
+                          {
+                            $eq: [
+                              "$latestBilling.paymentDetails.paymentType",
+                              "full",
+                            ],
+                          },
+                          { $eq: ["$latestBilling.status", "completed"] },
+                        ],
+                      },
+                      then: "fully_paid",
+                    },
+                  ],
+                  default: "unpaid",
+                },
+              },
+              else: "unpaid",
+            },
+          },
+
+          totalPaidAmount: {
+            $cond: {
+              if: { $gt: [{ $size: "$billingHistory" }, 0] },
+              then: { $sum: "$billingHistory.paymentDetails.paymentAmount" },
+              else: 0,
+            },
+          },
+
+          bookingPaymentAmount: {
+            $cond: {
+              if: { $gt: [{ $size: "$billingHistory" }, 0] },
+              then: "$latestBilling.matchingBooking.paymentAmount",
+              else: 0,
+            },
+          },
+
+          remainingBalance: {
+            $cond: {
+              if: { $gt: [{ $size: "$billingHistory" }, 0] },
+              then: {
+                $cond: {
+                  if: { $eq: ["$latestBilling.status", "partial"] },
+                  then: "$latestBilling.matchingBooking.remainingBalance",
+                  else: 0,
+                },
+              },
+              else: null,
+            },
+          },
+
+          isFullyPaid: {
+            $cond: {
+              if: { $gt: [{ $size: "$billingHistory" }, 0] },
+              then: {
+                $or: [
+                  { $eq: ["$latestBilling.status", "fully_paid"] },
+                  { $eq: ["$latestBilling.status", "completed"] },
+                  { $eq: ["$latestBilling.paymentDetails.paymentType", "full"] },
+                ],
+              },
+              else: false,
+            },
+          },
+
+          // ============================================================
+          // ✅ FIXED: isPayment = true LANG kung may FULLY_PAID status
+          //    sa billingHistory (hindi lang basta may match)
+          // ============================================================
+          isPayment: {
+            $gt: [
+              {
+                $size: {
+                  $filter: {
+                    input: "$billingHistory",
+                    as: "b",
+                    cond: {
+                      $or: [
+                        { $eq: ["$$b.status", "fully_paid"] },
+                        { $eq: ["$$b.status", "completed"] },
+                        {
+                          $and: [
+                            { $eq: ["$$b.paymentDetails.paymentType", "full"] },
+                            { $eq: ["$$b.status", "completed"] },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              0,
+            ],
+          },
+        },
+      },
+
+      // =========================
+      // 5. CALCULATE ADJUSTED AMOUNT
+      // =========================
+      {
+        $addFields: {
+          // Gamitin ang totalPrice kung mayroon
+          originalAmount: {
+            $cond: {
+              if: { $gt: ["$totalPrice", 0] },
+              then: "$totalPrice",
+              else: "$amount",
+            },
+          },
+
+          adjustedAmount: {
+            $cond: {
+              if: {
+                $and: [
+                  { $eq: ["$paymentStatus", "partial"] },
+                  { $gt: ["$bookingPaymentAmount", 0] },
+                ],
+              },
+              then: {
+                $subtract: [
+                  {
+                    $cond: {
+                      if: { $gt: ["$totalPrice", 0] },
+                      then: "$totalPrice",
+                      else: "$amount",
+                    },
+                  },
+                  "$bookingPaymentAmount",
+                ],
+              },
+              else: {
+                $cond: {
+                  if: { $gt: ["$totalPrice", 0] },
+                  then: "$totalPrice",
+                  else: "$amount",
+                },
+              },
+            },
+          },
+
+          displayAmount: {
+            $switch: {
+              branches: [
+                {
+                  case: { $eq: ["$paymentStatus", "fully_paid"] },
+                  then: 0,
+                },
+                {
+                  case: { $eq: ["$paymentStatus", "partial"] },
+                  then: {
+                    $subtract: [
+                      {
+                        $cond: {
+                          if: { $gt: ["$totalPrice", 0] },
+                          then: "$totalPrice",
+                          else: "$amount",
+                        },
+                      },
+                      "$bookingPaymentAmount",
+                    ],
+                  },
+                },
+              ],
+              default: {
+                $cond: {
+                  if: { $gt: ["$totalPrice", 0] },
+                  then: "$totalPrice",
+                  else: "$amount",
+                },
+              },
+            },
+          },
+
+          paymentStatusText: {
+            $switch: {
+              branches: [
+                {
+                  case: { $eq: ["$paymentStatus", "fully_paid"] },
+                  then: "Fully Paid",
+                },
+                {
+                  case: { $eq: ["$paymentStatus", "partial"] },
+                  then: "Partially Paid",
+                },
+              ],
+              default: "Unpaid",
+            },
+          },
+
+          paymentCount: { $size: "$billingHistory" },
+        },
+      },
+
+      // =========================
+      // 7. CLEANUP (EXCLUSION ONLY)
+      // =========================
+      {
+        $project: {
+          accommodation: 0,
+          service: 0,
+          activity: 0,
+          rental: 0,
+          customerUser: 0,
+          billingHistory: 0,
+          latestBilling: 0,
+          allBilling: 0,
+          // ✅ WALANG isPayment: 1 dito
+          //    Automatic nang kasama sa output dahil nasa $addFields na
+        },
+      },
+
+      // =========================
+      // 8. PAGINATION (FACET)
+      // =========================
+      {
+        $facet: {
+          metadata: [{ $count: "total" }],
+          data: [{ $skip: skip }, { $limit: pageSize }],
+        },
+      },
+    ]);
+
+    const totalCount = results[0].metadata[0]?.total || 0;
+    const bookings = results[0].data;
+    const totalPages = Math.ceil(totalCount / pageSize);
+    console.log("bookings", bookings);
+
+    return res.status(200).json({
+      success: true,
+      totalCount,
+      totalPages,
+      currentPage: parseInt(page),
+      limit: pageSize,
+      data: bookings,
+    });
+  } catch (error) {
+    console.error("❌ [getAllBookings] Error:", error);
+    console.error("❌ [getAllBookings] Stack:", error.stack);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch bookings",
+      error: error.message,
+      errorName: error.name,
+      errorCode: error.code,
+      ...(process.env.NODE_ENV === "development" && { stack: error.stack }),
+    });
+  }
+});
+
+exports.createBooking = AsyncErrorHandler(async (req, res) => {
+  try {
+    const {
+      bookingItemId,
+      bookingItemModel,
+      first_name,
+      last_name,
+      middle_name,
+      suffix,
+      email,
+      password,
+      expected_stay,
+      checkIn,
+      checkOut,
+      userId,
+    } = req.body;
+
+    const role = req.user.role;
+
+    let guestUserId = null;
+    let customerId = null;
+    let isWalkin = false;
+    let shouldCreateUser = true;
+
+    // =====================================
+    // 1. RECEPTIONIST / ADMIN — WALK-IN
+    // =====================================
+    if (role === "receptionist" || role === "admin") {
+      isWalkin = true;
+
+      if (bookingItemModel === "Rental" || bookingItemModel === "Service") {
+        shouldCreateUser = false;
+        console.log(
+          `ℹ️ ${bookingItemModel} booking - will create customer only, no user account`
+        );
+      }
+
+      // =====================================
+      // 1A. EXISTING USER (may userId)
+      // =====================================
+      if (userId) {
+        const existingUser = await UserLoginSchema.findById(userId);
+
+        if (existingUser) {
+          console.log(
+            `👤 Using existing user account: ${existingUser.username}`
+          );
+          guestUserId = existingUser._id;
+          customerId = existingUser.linkedId;
+
+          if (first_name || last_name || middle_name || suffix) {
+            await Customer.findByIdAndUpdate(customerId, {
+              first_name: first_name || existingUser.customer?.first_name,
+              last_name: last_name || existingUser.customer?.last_name,
+              middle_name: middle_name || existingUser.customer?.middle_name,
+              suffix: suffix || existingUser.customer?.suffix,
+            });
+          }
+        } else {
+          return res.status(404).json({
+            success: false,
+            message: "User not found with the provided userId",
+          });
+        }
+      }
+
+      // =====================================
+      // 1B. NEW WALK-IN (walang userId)
+      // =====================================
+      else {
+        // ─────────────────────────────────────
+        // ✅ WALK-IN: WALANG EMAIL/PASSWORD NA REQUIRED
+        //    (receptionist lang ang role na ito)
+        // ─────────────────────────────────────
+        console.log(
+          `ℹ️ Walk-in booking by ${role} — skipping email/password requirement`
+        );
+
+        // ─────────────────────────────────────
+        // 1B-1. Create Customer profile (NO email required)
+        // ─────────────────────────────────────
+        const customer = await Customer.create({
+          first_name: first_name || "Walk-in",
+          last_name: last_name || "Guest",
+          middle_name: middle_name || "",
+          suffix: suffix || "",
+          // ✅ Optional ang email — kung meron, gamitin; kung wala, blanko
+          ...(email && email.trim() ? { email: email.toLowerCase().trim() } : {}),
+          avatar: {
+            url: "",
+            public_id: "",
+          },
+        });
+
+        customerId = customer._id;
+        console.log(
+          `✅ Created walk-in customer: ${first_name || "Walk-in"} ${last_name || "Guest"} (${customerId})`
+        );
+
+        // ─────────────────────────────────────
+        // 1B-2. Create UserLogin account
+        // ─────────────────────────────────────
+        if (shouldCreateUser) {
+          const existingUser = await UserLoginSchema.findOne({
+            linkedId: customerId,
+          });
+
+          if (!existingUser) {
+            // ✅ Generira ng placeholder email/username kung walang binigay
+            const placeholderEmail =
+              email && email.trim()
+                ? email.toLowerCase().trim()
+                : `walkin_${Date.now()}@walkin.local`;
+
+            const placeholderPassword =
+              password && password.length >= 6
+                ? password
+                : `walkin_${Date.now()}_temp`; // default temp password
+
+            console.log("🔐 Creating walk-in UserLoginSchema with:", {
+              email: placeholderEmail,
+              username: placeholderEmail,
+              role: "customer",
+              linkedId: customerId,
+              passwordLength: placeholderPassword.length,
+            });
+
+            const newUser = await UserLoginSchema.create({
+              first_name: first_name || "Walk-in",
+              last_name: last_name || "Guest",
+              middle_name: middle_name || "",
+              suffix: suffix || "",
+              email: placeholderEmail,
+              password: placeholderPassword,
+              confirmPassword: placeholderPassword,
+              username: placeholderEmail,
+              role: "customer",
+              linkedId: customerId,
+              isVerified: false, // hindi verified dahil hindi naka-register
+            });
+
+            guestUserId = newUser._id;
+
+            // =====================================
+            // 🔍 VERIFY
+            // =====================================
+            const verifyUser = await UserLoginSchema.findById(newUser._id)
+              .select("+password")
+              .lean();
+
+            console.log("=".repeat(60));
+            console.log("✅ WALK-IN USER CREATED — VERIFICATION");
+            console.log("=".repeat(60));
+            console.log("📧 email:", verifyUser?.email);
+            console.log("👤 username:", verifyUser?.username);
+            console.log(
+              "🔑 password:",
+              verifyUser?.password
+                ? `✅ HASHED (${verifyUser.password.substring(0, 15)}...)`
+                : "❌ MISSING"
+            );
+            console.log("🎭 role:", verifyUser?.role);
+            console.log("🔗 linkedId:", verifyUser?.linkedId);
+            console.log("=".repeat(60));
+          } else {
+            console.log(
+              `👤 Guest already has user account: ${existingUser.username}`
+            );
+            guestUserId = existingUser._id;
+          }
+        } else {
+          // Rental / Service — temporary user lang
+          console.log(
+            `ℹ️ No full user account created for ${bookingItemModel} booking`
+          );
+
+          // ✅ Placeholder din para sa temp user
+          const placeholderEmail =
+            email && email.trim()
+              ? email.toLowerCase().trim()
+              : `walkin_temp_${Date.now()}@walkin.local`;
+
+          const placeholderPassword =
+            password && password.length >= 6
+              ? password
+              : `walkin_temp_${Date.now()}`;
+
+          const tempUser = await UserLoginSchema.create({
+            first_name: first_name || "Walk-in",
+            last_name: last_name || "Guest",
+            email: placeholderEmail,
+            username: `walkin_temp_${Date.now()}`,
+            password: placeholderPassword,
+            confirmPassword: placeholderPassword,
+            role: "customer",
+            linkedId: customerId,
+            isVerified: false,
+          });
+
+          guestUserId = tempUser._id;
+          console.log(
+            `✅ Created temporary user account for ${bookingItemModel} booking (${tempUser._id})`
+          );
+        }
+      }
+    }
+
+    // =====================================
+    // 2. NON-RECEPTIONIST (regular user)
+    // =====================================
+    else {
+      customerId = req.body.userId || req.body.customerId;
+      isWalkin = false;
+
+      const user = await UserLoginSchema.findById(customerId);
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+      guestUserId = customerId;
+    }
+
+    // =====================================
+    // 3. DETERMINE BOOKING STATUS
+    //    ✅ FIXED: Lahat ng bagong booking ay "Pending"
+    //    (i-approve via updateBookingStatus ng admin/receptionist)
+    // =====================================
+    const bookingStatus = "Pending";
+    console.log(
+      `📌 Booking status set to: ${bookingStatus} (isWalkin: ${isWalkin})`
+    );
+
+    // =====================================
+    // 4. COMPUTE CHECK-IN / CHECK-OUT
+    // =====================================
+    const finalCheckIn = checkIn ? new Date(checkIn) : new Date();
+
+    let finalCheckOut = checkOut ? new Date(checkOut) : null;
+    if (!finalCheckOut && finalCheckIn && expected_stay) {
+      finalCheckOut = new Date(finalCheckIn);
+      finalCheckOut.setDate(
+        finalCheckOut.getDate() + parseInt(expected_stay)
+      );
+    }
+
+    console.log("📍 Final checkIn:", finalCheckIn);
+    console.log("📍 Final checkOut:", finalCheckOut);
+
+    // =====================================
+    // 4.5 COMPUTE UNIT PRICE / WEEKEND / TOTAL
+    // =====================================
+    const unitPrice = await getItemUnitPrice(
+      bookingItemId,
+      bookingItemModel
+    );
+    const isWeekend = isWeekendDate(finalCheckIn);
+    const totalPrice = computeTotalPrice(
+      unitPrice,
+      expected_stay,
+      bookingItemModel
+    );
+
+    console.log("💰 unitPrice:", unitPrice);
+    console.log("💰 isWeekend:", isWeekend);
+    console.log("💰 totalPrice:", totalPrice);
+
+    // =====================================
+    // 5. CREATE BOOKING
+    // =====================================
+    const booking = await ActionBooking.create({
+      customerId: guestUserId,
+      bookingItemId,
+      bookingItemModel,
+      isWalkin: isWalkin,
+      expected_stay: expected_stay || 1,
+      checkIn: finalCheckIn,
+      checkOut: finalCheckOut,
+      status: bookingStatus,
+
+      unitPrice: req.body.unitPrice,
+      isWeekend: req.body.isWeekend,
+      totalPrice: req.body.totalPrice,
+      weekdaysPrice: req.body.weekdaysPrice,
+      weekendPrice: req.body.weekendPrice,
+      weekdaysBreakfastPrice: req.body.weekdaysBreakfastPrice,
+      weekendBreakfastPrice: req.body.weekendBreakfastPrice,
+    });
+
+    // =====================================
+    // 6. AGGREGATION (FULL DETAILS)
+    // =====================================
+    const detailedBookingArray = await ActionBooking.aggregate([
+      { $match: { _id: booking._id } },
+      {
+        $lookup: {
+          from: "userloginschemas",
+          localField: "customerId",
+          foreignField: "_id",
+          as: "customerUser",
+        },
+      },
+      { $unwind: { path: "$customerUser", preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: "customers",
+          localField: "customerUser.linkedId",
+          foreignField: "_id",
+          as: "customer",
+        },
+      },
+      { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+
+      // ACCOMMODATION
+      {
+        $lookup: {
+          from: "accommodations",
+          let: { id: "$bookingItemId", model: "$bookingItemModel" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$_id", "$$id"] },
+                    { $eq: ["$$model", "Accommodation"] },
+                  ],
+                },
+              },
+            },
+          ],
+          as: "accommodation",
+        },
+      },
+      // SERVICE
+      {
+        $lookup: {
+          from: "services",
+          let: { id: "$bookingItemId", model: "$bookingItemModel" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$_id", "$$id"] },
+                    { $eq: ["$$model", "Service"] },
+                  ],
+                },
+              },
+            },
+          ],
+          as: "service",
+        },
+      },
+      // ACTIVITY
+      {
+        $lookup: {
+          from: "activities",
+          let: { id: "$bookingItemId", model: "$bookingItemModel" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$_id", "$$id"] },
+                    { $eq: ["$$model", "Activity"] },
+                  ],
+                },
+              },
+            },
+          ],
+          as: "activity",
+        },
+      },
+      // RENTAL
+      {
+        $lookup: {
+          from: "rentals",
+          let: { id: "$bookingItemId", model: "$bookingItemModel" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$_id", "$$id"] },
+                    { $eq: ["$$model", "Rental"] },
+                  ],
+                },
+              },
+            },
+          ],
+          as: "rental",
+        },
+      },
+      // MERGE FINAL ITEM
+      {
+        $addFields: {
+          bookingItem: {
+            $switch: {
+              branches: [
+                {
+                  case: { $eq: ["$bookingItemModel", "Accommodation"] },
+                  then: { $arrayElemAt: ["$accommodation", 0] },
+                },
+                {
+                  case: { $eq: ["$bookingItemModel", "Service"] },
+                  then: { $arrayElemAt: ["$service", 0] },
+                },
+                {
+                  case: { $eq: ["$bookingItemModel", "Activity"] },
+                  then: { $arrayElemAt: ["$activity", 0] },
+                },
+                {
+                  case: { $eq: ["$bookingItemModel", "Rental"] },
+                  then: { $arrayElemAt: ["$rental", 0] },
+                },
+              ],
+              default: null,
+            },
+          },
+        },
+      },
       {
         $project: {
           accommodation: 0,
@@ -2252,6 +2293,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
 
       io.to("admin").emit("newNotification", notifPayload);
       io.to("receptionist").emit("newNotification", notifPayload);
+      io.to("receptionist").emit("createBooking", notifPayload);
 
       console.log("🔔 NOTIFICATION EMITTED TO ADMIN + RECEPTIONIST ONLY");
     }
@@ -2276,11 +2318,11 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
       } else {
         responseData.customerInfo = {
           customerId: customerId,
-          name: `${first_name} ${last_name}`,
-          email: email,
+          name: `${first_name || "Walk-in"} ${last_name || "Guest"}`,
+          email: email || null, // ✅ optional — puwedeng null
           bookingType: bookingItemModel,
           hasUserAccount: shouldCreateUser,
-          username: shouldCreateUser ? email : null,
+          username: null, // walk-in walang username
           isWalkin: true,
           expected_stay: expected_stay || 1,
           checkIn: finalCheckIn,
@@ -2290,8 +2332,8 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
           isWeekend: req.body.isWeekend,
           totalPrice: req.body.totalPrice,
           message: shouldCreateUser
-            ? "Customer and user account created"
-            : "Customer created (no user account for rentals/services)",
+            ? "Walk-in customer and temporary account created"
+            : "Walk-in customer created (no user account for rentals/services)",
         };
       }
     }
@@ -2311,7 +2353,6 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     });
   }
 });
-
 // =====================================
 // GET SINGLE BOOKING
 // =====================================
@@ -2338,7 +2379,16 @@ exports.getSingleBooking = AsyncErrorHandler(async (req, res) => {
 // =====================================
 exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
   try {
-    const { status, approverId, checkIn, checkOut, expected_stay } = req.body;
+    const {
+      status,
+      approverId,
+      checkIn,
+      checkOut,
+      expected_stay,
+      actualNumberGuest, // ✅ idinagdag
+    } = req.body;
+
+    console.log("req.body", req.body);
 
     let booking = await ActionBooking.findById(req.params.id);
 
@@ -2359,10 +2409,41 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
         checkIn,
         checkOut,
         expected_stay,
+        actualNumberGuest, // ✅ idinagdag
       }).filter(
         ([_, value]) => value !== undefined && value !== null && value !== ""
       )
     );
+
+    // ✅ Cast actualNumberGuest sa Number + validation
+    if (updateData.actualNumberGuest !== undefined) {
+      updateData.actualNumberGuest = Number(updateData.actualNumberGuest);
+      if (Number.isNaN(updateData.actualNumberGuest)) {
+        return res.status(400).json({
+          success: false,
+          message: "actualNumberGuest must be a valid number",
+        });
+      }
+      if (updateData.actualNumberGuest < 1) {
+        return res.status(400).json({
+          success: false,
+          message: "actualNumberGuest must be at least 1",
+        });
+      }
+    }
+
+    // ✅ Require actualNumberGuest kapag CheckIn
+    if (updateData.status === "CheckIn") {
+      if (
+        updateData.actualNumberGuest === undefined ||
+        updateData.actualNumberGuest < 1
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "actualNumberGuest is required when status is CheckIn",
+        });
+      }
+    }
 
     // Auto-compute checkOut kung may checkIn at expected_stay pero walang checkOut
     if (updateData.checkIn && updateData.expected_stay && !updateData.checkOut) {
@@ -2695,8 +2776,6 @@ exports.getMyAccomodation = AsyncErrorHandler(async (req, res, next) => {
 
     matchStage.customerId = userLogin._id;
   }
-
-  console.log("MATCH STAGE:", JSON.stringify(matchStage));
 
   const accommodationCollection =
     mongoose.model("Accommodation").collection.name;

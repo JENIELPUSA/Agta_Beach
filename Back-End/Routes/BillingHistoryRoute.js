@@ -68,6 +68,13 @@ router
     billingHistoryController.getBillingHistoryByDateRange
   );
 
+router
+  .route("/customers-with-history")
+  .get(
+    authController.protect,
+    billingHistoryController.getCustomersWithHistory
+  );
+
 // 🔍 By transaction ID
 router
   .route("/transaction/:transactionId")

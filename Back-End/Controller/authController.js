@@ -30,16 +30,23 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       email,
       role,
       gender,
+      dob,
+      address,
+      specialty,
+      emergency_contact_name,
+      emergency_contact_number,
     } = req.body;
 
-    console.log("RequestBody received:", req.body);
-
     const defaultPassword = "123456789";
-
     const selectedRole = role ? role.toLowerCase() : "";
 
     const requiredFieldsByRole = {
       customer: ["first_name", "last_name", "email", "gender"],
+      patient: [
+        "first_name", "last_name", "email", "gender", "dob", "address",
+        "emergency_contact_name", "emergency_contact_number",
+      ],
+      doctor: ["first_name", "last_name", "email", "gender", "dob", "address", "specialty"],
       receptionist: ["first_name", "last_name", "email"],
       staff: ["first_name", "last_name", "email"],
       admin: ["first_name", "last_name", "email"],
@@ -47,41 +54,42 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
     };
 
     const requiredFields = requiredFieldsByRole[selectedRole];
-
     if (!requiredFields) {
       return res.status(400).json({
-        message:
-          "Invalid role provided. Must be 'admin', 'customer', 'receptionist', or 'user'.",
+        message: "Invalid role provided.",
       });
     }
 
     const missingFields = requiredFields.filter((field) => !req.body[field]);
-
     if (missingFields.length > 0) {
       return res.status(400).json({
         message: `Missing required fields: ${missingFields.join(", ")}`,
       });
     }
 
-    const existingUser = await UserLogin.findOne({ username: email });
-
-    if (existingUser) {
-      return res.status(400).json({
-        message: "User with this email already exists!",
-      });
+    if (contact_number && !/^\d{11}$/.test(contact_number)) {
+      return res.status(400).json({ message: "Contact number must be exactly 11 digits" });
+    }
+    if (emergency_contact_number && !/^\d{11}$/.test(emergency_contact_number)) {
+      return res.status(400).json({ message: "Emergency contact number must be exactly 11 digits" });
     }
 
-    let avatar = { url: "", public_id: "" };
+    // ✅ Use .lean() + select only needed field — mas mabilis
+    const existingUser = await UserLogin.findOne({ username: email })
+      .select("_id")
+      .lean();
 
-    if (req.file) {
+    if (existingUser) {
+      return res.status(400).json({ message: "User with this email already exists!" });
+    }
+
+    // ✅ Run avatar upload in parallel with DB prep (hindi hinihintay agad)
+    const avatarPromise = (async () => {
+      if (!req.file) return { url: "", public_id: "" };
+
       const fileName = req.file.filename;
       const form = new FormData();
-
-      form.append(
-        "file",
-        fs.createReadStream(req.file.path),
-        req.file.originalname,
-      );
+      form.append("file", fs.createReadStream(req.file.path), req.file.originalname);
 
       try {
         const response = await axios.post(process.env.UPLOAD_URL, form, {
@@ -90,54 +98,38 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
         });
 
         if (response.data.success) {
-          avatar = {
-            url: response.data.url,
-            public_id: fileName,
-          };
-
-          fs.unlink(req.file.path, (err) => {
-            if (err) console.error("Failed to delete temp file:", err);
-          });
+          // ✅ Delete temp file asynchronously (non-blocking)
+          fs.unlink(req.file.path, () => {});
+          return { url: response.data.url, public_id: fileName };
         }
       } catch (err) {
         console.error("❌ Upload failed:", err.message);
       }
-    }
+      return { url: "", public_id: "" };
+    })();
 
-    let linkedRecord;
+    // ✅ Prepare profile payload habang nag-a-upload
+    const baseProfileData = {
+      first_name, last_name, middle_name, email, gender, contact_number, dob, address,
+    };
 
-    if (selectedRole === "customer") {
-      // 👉 Customer Schema
-      linkedRecord = await Customer.create({
-        avatar,
-        first_name,
-        last_name,
-        middle_name,
-        email,
-        gender,
-        contact_number,
-      });
-    } else if (selectedRole === "admin" || selectedRole === "receptionist" || selectedRole === "staff") {
-      linkedRecord = await Admin.create({
-        avatar,
-        first_name,
-        last_name,
-        middle_name,
-        email,
-        gender,
-        contact_number,
-      });
+    let profilePayload;
+    if (selectedRole === "customer" || selectedRole === "patient") {
+      profilePayload = { ...baseProfileData, emergency_contact_name, emergency_contact_number };
+    } else if (selectedRole === "doctor") {
+      profilePayload = { ...baseProfileData, specialty };
     } else {
-      linkedRecord = await Admin.create({
-        avatar,
-        first_name,
-        last_name,
-        middle_name,
-        email,
-        gender,
-        contact_number,
-      });
+      profilePayload = { ...baseProfileData };
     }
+
+    // ✅ Hintayin ang avatar (parallel na nangyari)
+    const avatar = await avatarPromise;
+
+    // ✅ Create profile + user login in parallel (walang dependency sa isa't isa maliban sa linkedId)
+    //    Kaya: gumawa muna ng profile, tapos login — pero gamitin ang lean/create options
+    const linkedRecord = await (selectedRole === "customer" || selectedRole === "patient"
+      ? Customer.create({ avatar, ...profilePayload })
+      : Admin.create({ avatar, ...profilePayload }));
 
     const newUserLogin = await UserLogin.create({
       avatar,
@@ -150,11 +142,19 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       isVerified: true,
     });
 
-    try {
-      await sendEmail({
-        email,
-        subject: "Your Account Credentials",
-        text: `Welcome to the system!
+    // ✅ I-respond agad — HUWAG hintayin ang email
+    res.status(201).json({
+      status: "Success",
+      message: "User created successfully",
+      user: newUserLogin,
+      profile: linkedRecord,
+    });
+
+    // ✅ Fire-and-forget: email + socket emit AFTER response
+    sendEmail({
+      email,
+      subject: "Your Account Credentials",
+      text: `Welcome to the system!
 
 Your account has been created successfully.
 
@@ -162,30 +162,15 @@ Username: ${email}
 Default Password: ${defaultPassword}
 
 Please change your password after logging in.`,
-      });
-    } catch (err) {
-      console.error("❌ Failed to send signup email:", err.message);
-    }
+    }).catch((err) => console.error("❌ Failed to send signup email:", err.message));
 
     const io = req.app.get("io");
     if (io) {
       io.emit("newUserSignup", {
-        user: {
-          id: newUserLogin._id,
-          first_name,
-          last_name,
-          role: selectedRole,
-        },
+        user: { id: newUserLogin._id, first_name, last_name, role: selectedRole },
         profile: linkedRecord,
       });
     }
-
-    res.status(201).json({
-      status: "Success",
-      message: "User created successfully",
-      user: newUserLogin,
-      profile: linkedRecord,
-    });
   } catch (error) {
     console.error("❌ Signup failed:", error);
     res.status(500).json({
