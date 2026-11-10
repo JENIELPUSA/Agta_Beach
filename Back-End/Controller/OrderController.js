@@ -14,274 +14,455 @@ const AuditTrail = require("../Models/AuditlogsSchema");
 
 
 exports.checkout = AsyncErrorHandler(async (req, res) => {
-    const {
-        userId,
-        cartId,
-        payment,
-        delivery,
-        notes,
-        defaultLocationId,
-        items = [],
-    } = req.body;
-
-    console.log("📥 req.body:", req.body);
-
-    if (!userId) {
-        return res.status(400).json({ status: "fail", message: "UserId is required." });
-    }
-    if (!cartId) {
-        return res.status(400).json({ status: "fail", message: "Cart ID is required." });
-    }
-    if (!payment) {
-        return res.status(400).json({ status: "fail", message: "Payment details are required." });
-    }
-    if (!defaultLocationId) {
-        return res.status(400).json({ status: "fail", message: "Default location is required." });
-    }
-
-    let matchedBooking = null;
     try {
-        matchedBooking = await ActionBooking.findById(defaultLocationId)
-            .select("_id customerId bookingItemId bookingNumber bookingItemModel status setdefault")
-            .lean();
+        const {
+            userId,
+            cartId,
+            payment,
+            delivery,
+            notes,
+            defaultLocationId,
+            items = [],
+            _isReceptionist, // optional flag from frontend
+        } = req.body;
 
-        console.log("📍 [CHECKOUT] Matched ActionBooking:", matchedBooking);
-    } catch (err) {
-        console.error("❌ Error finding ActionBooking:", err.message);
-    }
+        console.log("📥 req.body:", req.body);
 
-    if (!matchedBooking) {
-        return res.status(404).json({
-            status: "fail",
-            message: "Default location not found in bookings.",
-        });
-    }
-
-    const deliveryLocationId = matchedBooking.bookingItemId;
-    const bookingCustomerId = matchedBooking.customerId;
-
-    console.log("📍 [CHECKOUT] Extracted bookingItemId:", deliveryLocationId);
-    console.log("📍 [CHECKOUT] Extracted bookingCustomerId:", bookingCustomerId);
-
-    if (!deliveryLocationId) {
-        return res.status(400).json({
-            status: "fail",
-            message: "Booking item ID not found for this location.",
-        });
-    }
-
-    let matchedAccommodation = null;
-    try {
-        matchedAccommodation = await Accommodation.findById(deliveryLocationId)
-            .select("_id name description type minCapacity maxCapacity pricePerDay amenities status avatar")
-            .lean();
-
-        console.log("📍 [CHECKOUT] Matched Accommodation:", matchedAccommodation);
-    } catch (err) {
-        console.error("❌ Error finding Accommodation:", err.message);
-    }
-
-    if (!matchedAccommodation) {
-        return res.status(404).json({
-            status: "fail",
-            message: "Accommodation not found.",
-        });
-    }
-
-    let matchedUserLogin = null;
-    try {
-        matchedUserLogin = await UserLogin.findById(bookingCustomerId)
-            .select("_id linkedId role")
-            .lean();
-
-        console.log("📍 [CHECKOUT] Matched UserLogin:", matchedUserLogin);
-    } catch (err) {
-        console.error("❌ Error finding UserLogin:", err.message);
-    }
-
-    if (!matchedUserLogin) {
-        return res.status(404).json({
-            status: "fail",
-            message: "UserLogin not found.",
-        });
-    }
-
-    const customerProfileId = matchedUserLogin.linkedId;
-
-    console.log("📍 [CHECKOUT] Extracted linkedId (Customer._id):", customerProfileId);
-
-    if (!customerProfileId) {
-        return res.status(400).json({
-            status: "fail",
-            message: "Customer linkedId not found.",
-        });
-    }
-
-    let matchedCustomer = null;
-    try {
-        matchedCustomer = await Customer.findById(customerProfileId)
-            .select("_id first_name last_name middle_name suffix gender email avatar")
-            .lean();
-
-        console.log("📍 [CHECKOUT] Matched Customer:", matchedCustomer);
-    } catch (err) {
-        console.error("❌ Error finding Customer:", err.message);
-    }
-
-    if (!matchedCustomer) {
-        return res.status(404).json({
-            status: "fail",
-            message: "Customer profile not found.",
-        });
-    }
-
-    const fullName = [
-        matchedCustomer.first_name,
-        matchedCustomer.middle_name,
-        matchedCustomer.last_name,
-        matchedCustomer.suffix,
-    ]
-        .filter(Boolean)
-        .join(" ")
-        .trim();
-
-    console.log("📍 [CHECKOUT] Full Customer Name:", fullName);
-
-    const cart = await Cart.findOne({
-        _id: cartId,
-        customerId: userId,
-    }).populate({
-        path: "items.foodId",
-        select: "name category price avatar image",
-    });
-
-    if (!cart) {
-        return res.status(404).json({ status: "fail", message: "Cart not found." });
-    }
-    if (!cart.items || cart.items.length === 0) {
-        return res.status(400).json({ status: "fail", message: "Cart is empty." });
-    }
-
-    const orderId = `ORD-${Date.now()}-${Math.random()
-        .toString(36)
-        .substring(2, 7)
-        .toUpperCase()}`;
-
-    const orderItems = cart.items.map((cartItem) => {
-        const frontendItem = items.find(
-            (i) => i.foodId.toString() === cartItem.foodId._id.toString()
-        );
-
-        return {
-            foodId: cartItem.foodId._id,
-            name: cartItem.foodId.name,
-            category: cartItem.foodId.category || "General",
-            image:
-                frontendItem?.image ||
-                cartItem.foodId.avatar ||
-                cartItem.foodId.image ||
-                "",
-            quantity: cartItem.quantity,
-            price: cartItem.foodId.price,
-            subtotal: cartItem.quantity * cartItem.foodId.price,
-        };
-    });
-
-    const totalItems = orderItems.length;
-    const totalQuantity = orderItems.reduce((sum, item) => sum + item.quantity, 0);
-    const totalAmount = orderItems.reduce((sum, item) => sum + item.subtotal, 0);
-
-    const orderData = {
-        orderId,
-        userId,
-        orderDate: new Date(),
-        status: "pending",
-
-        customer: {
-            id: matchedUserLogin._id,
-            name: fullName || "",
-            room: matchedAccommodation.name || "",
-            status: matchedBooking.status || "",
-            points: 0,
-            checkOut: "",
-        },
-
-        items: orderItems,
-
-        totals: {
-            totalItems,
-            totalQuantity,
-            totalAmount,
-        },
-
-        payment: {
-            method: payment.method || "pending",
-            status: payment.status || "pending",
-            amount: payment.amount || totalAmount,
-            currency: payment.currency || "PHP",
-        },
-
-        deliveryId: deliveryLocationId,
-
-        delivery: {
-            roomNumber: matchedAccommodation.name || "",
-            status: "pending",
-            notes: delivery?.notes || notes || "",
-            DeliveryLocationId: deliveryLocationId,
-            DeliveryLocationName: matchedAccommodation.name || "",
-            DeliveryLocationDescription: matchedAccommodation.description || "",
-            DeliveryLocationType: matchedAccommodation.type || "",
-            DeliveryLocationMinCapacity: matchedAccommodation.minCapacity || 0,
-            DeliveryLocationMaxCapacity: matchedAccommodation.maxCapacity || 0,
-            DeliveryLocationPrice: matchedAccommodation.pricePerDay || 0,
-            DeliveryLocationAmenities: matchedAccommodation.amenities || [],
-            DeliveryLocationStatus: matchedAccommodation.status || "available",
-            DeliveryLocationAvatar: matchedAccommodation.avatar?.[0]?.url || "",
-            DeliveryBookingId: matchedBooking._id,
-            DeliveryBookingNumber: matchedBooking.bookingNumber || "",
-        },
-
-        timestamp: new Date(),
-    };
-
-    console.log("\n========================================");
-    console.log("📦 [CHECKOUT] PAYLOADS TO SAVE");
-    console.log("========================================");
-    console.log("🆔 orderId:", orderData.orderId);
-    console.log("👤 userId:", orderData.userId);
-    console.log("📅 orderDate:", orderData.orderDate);
-    console.log("📌 status:", orderData.status);
-    console.log("\n👤 CUSTOMER (from Customer lookup):");
-    console.log(JSON.stringify(orderData.customer, null, 2));
-    console.log("\n🍔 ITEMS:", orderData.items.length, "item(s)");
-    console.log("\n💰 TOTALS:", JSON.stringify(orderData.totals, null, 2));
-    console.log("\n💳 PAYMENT:", JSON.stringify(orderData.payment, null, 2));
-    console.log("\n🚚 DELIVERY:", JSON.stringify(orderData.delivery, null, 2));
-    console.log("\n📍 LOOKUP CHAIN:");
-    console.log("  ActionBooking._id:", matchedBooking._id);
-    console.log("  → bookingItemId (Accommodation._id):", deliveryLocationId);
-    console.log("  → customerId (UserLogin._id):", bookingCustomerId);
-    console.log("  → linkedId (Customer._id):", customerProfileId);
-    console.log("  → Customer Name:", fullName);
-    console.log("========================================\n");
-
-    const newOrder = await Order.create(orderData);
-
-    try {
-        const deletedCart = await Cart.findByIdAndDelete(cartId);
-        if (deletedCart) {
-            console.log(`🗑️ Cart permanently deleted for user: ${userId}`);
-            console.log(`📋 Deleted cart ID: ${deletedCart._id}`);
+        // ─── Basic validation ─────────────────────────────────────
+        if (!userId) {
+            return res.status(400).json({ status: "fail", message: "UserId is required." });
         }
-    } catch (err) {
-        console.error("❌ Error deleting cart:", err.message);
-    }
+        if (!cartId) {
+            return res.status(400).json({ status: "fail", message: "Cart ID is required." });
+        }
+        if (!payment) {
+            return res.status(400).json({ status: "fail", message: "Payment details are required." });
+        }
 
-    return res.status(201).json({
-        status: "success",
-        message: "Order placed successfully! Cart has been cleared.",
-        data: newOrder,
-    });
+        // ─── Resolve Receptionist flag ────────────────────────────
+        let isReceptionist = _isReceptionist === true;
+
+        if (!isReceptionist && userId) {
+            try {
+                const requester = await UserLogin.findById(userId)
+                    .select("_id role")
+                    .lean();
+                const r = String(requester?.role || "").toLowerCase();
+                if (r === "receptionist" || r === "receptionest") {
+                    isReceptionist = true;
+                }
+            } catch (err) {
+                console.error("❌ Error resolving requester role:", err.message);
+            }
+        }
+
+        console.log("🧑‍💼 [CHECKOUT] Is Receptionist:", isReceptionist);
+
+        // ─── Location requirement (skipped for Receptionist) ─────
+        if (!isReceptionist && !defaultLocationId) {
+            return res.status(400).json({
+                status: "fail",
+                message: "Default location is required.",
+            });
+        }
+
+        // ─── Booking / Accommodation / Customer lookup ────────────
+        let matchedBooking = null;
+        let matchedAccommodation = null;
+        let matchedUserLogin = null;
+        let matchedCustomer = null;
+        let deliveryLocationId = null;
+        let bookingCustomerId = null;
+        let customerProfileId = null;
+        let fullName = "";
+
+        if (!isReceptionist) {
+            // ----- Original flow (guest with booking) -----
+            try {
+                matchedBooking = await ActionBooking.findById(defaultLocationId)
+                    .select("_id customerId bookingItemId bookingNumber bookingItemModel status setdefault")
+                    .lean();
+
+                console.log("📍 [CHECKOUT] Matched ActionBooking:", matchedBooking);
+            } catch (err) {
+                console.error("❌ Error finding ActionBooking:", err.message);
+            }
+
+            if (!matchedBooking) {
+                return res.status(404).json({
+                    status: "fail",
+                    message: "Default location not found in bookings.",
+                });
+            }
+
+            deliveryLocationId = matchedBooking.bookingItemId;
+            bookingCustomerId = matchedBooking.customerId;
+
+            console.log("📍 [CHECKOUT] Extracted bookingItemId:", deliveryLocationId);
+            console.log("📍 [CHECKOUT] Extracted bookingCustomerId:", bookingCustomerId);
+
+            if (!deliveryLocationId) {
+                return res.status(400).json({
+                    status: "fail",
+                    message: "Booking item ID not found for this location.",
+                });
+            }
+
+            try {
+                matchedAccommodation = await Accommodation.findById(deliveryLocationId)
+                    .select("_id name description type minCapacity maxCapacity pricePerDay amenities status avatar")
+                    .lean();
+
+                console.log("📍 [CHECKOUT] Matched Accommodation:", matchedAccommodation);
+            } catch (err) {
+                console.error("❌ Error finding Accommodation:", err.message);
+            }
+
+            if (!matchedAccommodation) {
+                return res.status(404).json({
+                    status: "fail",
+                    message: "Accommodation not found.",
+                });
+            }
+
+            try {
+                matchedUserLogin = await UserLogin.findById(bookingCustomerId)
+                    .select("_id linkedId role")
+                    .lean();
+
+                console.log("📍 [CHECKOUT] Matched UserLogin:", matchedUserLogin);
+            } catch (err) {
+                console.error("❌ Error finding UserLogin:", err.message);
+            }
+
+            if (!matchedUserLogin) {
+                return res.status(404).json({
+                    status: "fail",
+                    message: "UserLogin not found.",
+                });
+            }
+
+            customerProfileId = matchedUserLogin.linkedId;
+
+            console.log("📍 [CHECKOUT] Extracted linkedId (Customer._id):", customerProfileId);
+
+            if (!customerProfileId) {
+                return res.status(400).json({
+                    status: "fail",
+                    message: "Customer linkedId not found.",
+                });
+            }
+
+            try {
+                matchedCustomer = await Customer.findById(customerProfileId)
+                    .select("_id first_name last_name middle_name suffix gender email avatar")
+                    .lean();
+
+                console.log("📍 [CHECKOUT] Matched Customer:", matchedCustomer);
+            } catch (err) {
+                console.error("❌ Error finding Customer:", err.message);
+            }
+
+            if (!matchedCustomer) {
+                return res.status(404).json({
+                    status: "fail",
+                    message: "Customer profile not found.",
+                });
+            }
+
+            fullName = [
+                matchedCustomer.first_name,
+                matchedCustomer.middle_name,
+                matchedCustomer.last_name,
+                matchedCustomer.suffix,
+            ]
+                .filter(Boolean)
+                .join(" ")
+                .trim();
+
+            console.log("📍 [CHECKOUT] Full Customer Name:", fullName);
+        } else {
+            // ----- Receptionist flow (walk-in order) -----
+            console.log("🧑‍💼 [CHECKOUT] Receptionist walk-in order — skipping booking/accommodation lookup.");
+
+            // Optional: still try to resolve the receptionist's own profile
+            // (for logging / audit trail). Failure is non-fatal.
+            try {
+                const requester = await UserLogin.findById(userId)
+                    .select("_id linkedId role")
+                    .lean();
+                if (requester?.linkedId) {
+                    const profile = await Customer.findById(requester.linkedId)
+                        .select("_id first_name last_name middle_name suffix")
+                        .lean();
+                    if (profile) {
+                        fullName = [
+                            profile.first_name,
+                            profile.middle_name,
+                            profile.last_name,
+                            profile.suffix,
+                        ]
+                            .filter(Boolean)
+                            .join(" ")
+                            .trim();
+                    }
+                }
+            } catch (err) {
+                console.error("⚠️ Non-fatal: failed to resolve receptionist profile:", err.message);
+            }
+        }
+
+        // ─── Cart lookup ──────────────────────────────────────────
+        const cart = await Cart.findOne({
+            _id: cartId,
+            customerId: userId,
+        }).populate({
+            path: "items.foodId",
+            select: "name category price avatar image",
+        });
+
+        if (!cart) {
+            return res.status(404).json({ status: "fail", message: "Cart not found." });
+        }
+        if (!cart.items || cart.items.length === 0) {
+            return res.status(400).json({ status: "fail", message: "Cart is empty." });
+        }
+
+        // ─── Build order items ────────────────────────────────────
+        const orderId = `ORD-${Date.now()}-${Math.random()
+            .toString(36)
+            .substring(2, 7)
+            .toUpperCase()}`;
+
+        const orderItems = cart.items.map((cartItem) => {
+            const frontendItem = items.find(
+                (i) => i.foodId?.toString() === cartItem.foodId._id.toString()
+            );
+
+            return {
+                foodId: cartItem.foodId._id,
+                name: cartItem.foodId.name,
+                category: cartItem.foodId.category || "General",
+                image:
+                    frontendItem?.image ||
+                    cartItem.foodId.avatar ||
+                    cartItem.foodId.image ||
+                    "",
+                quantity: cartItem.quantity,
+                price: cartItem.foodId.price,
+                subtotal: cartItem.quantity * cartItem.foodId.price,
+            };
+        });
+
+        const totalItems = orderItems.length;
+        const totalQuantity = orderItems.reduce((sum, item) => sum + item.quantity, 0);
+        const totalAmount = orderItems.reduce((sum, item) => sum + item.subtotal, 0);
+
+        // ─── Build order payload (branch by role) ─────────────────
+        let orderData;
+
+        if (isReceptionist) {
+            orderData = {
+                orderId,
+                userId,
+                orderDate: new Date(),
+                status: "pending",
+
+                customer: {
+                    id: userId,
+                    name: fullName || "Walk-in Guest",
+                    room: "Walk-in",
+                    status: "walk-in",
+                    points: 0,
+                    checkOut: "",
+                },
+
+                items: orderItems,
+
+                totals: {
+                    totalItems,
+                    totalQuantity,
+                    totalAmount,
+                },
+
+                payment: {
+                    method: payment.method || "pending",
+                    status: payment.status || "pending",
+                    amount: payment.amount || totalAmount,
+                    currency: payment.currency || "PHP",
+                },
+
+                // No deliveryId — walk-in
+                deliveryId: null,
+
+                delivery: {
+                    type: "walk-in",
+                    roomNumber: "Walk-in",
+                    status: "pending",
+                    notes: delivery?.notes || notes || "",
+                    DeliveryLocationId: null,
+                    DeliveryLocationName: "Walk-in",
+                    DeliveryLocationDescription: "",
+                    DeliveryLocationType: "walk-in",
+                    DeliveryLocationMinCapacity: 0,
+                    DeliveryLocationMaxCapacity: 0,
+                    DeliveryLocationPrice: 0,
+                    DeliveryLocationAmenities: [],
+                    DeliveryLocationStatus: "available",
+                    DeliveryLocationAvatar: "",
+                    DeliveryBookingId: null,
+                    DeliveryBookingNumber: "",
+                },
+
+                timestamp: new Date(),
+            };
+        } else {
+            orderData = {
+                orderId,
+                userId,
+                orderDate: new Date(),
+                status: "pending",
+
+                customer: {
+                    id: matchedUserLogin._id,
+                    name: fullName || "",
+                    room: matchedAccommodation.name || "",
+                    status: matchedBooking.status || "",
+                    points: 0,
+                    checkOut: "",
+                },
+
+                items: orderItems,
+
+                totals: {
+                    totalItems,
+                    totalQuantity,
+                    totalAmount,
+                },
+
+                payment: {
+                    method: payment.method || "pending",
+                    status: payment.status || "pending",
+                    amount: payment.amount || totalAmount,
+                    currency: payment.currency || "PHP",
+                },
+
+                deliveryId: deliveryLocationId,
+
+                delivery: {
+                    roomNumber: matchedAccommodation.name || "",
+                    status: "pending",
+                    notes: delivery?.notes || notes || "",
+                    DeliveryLocationId: deliveryLocationId,
+                    DeliveryLocationName: matchedAccommodation.name || "",
+                    DeliveryLocationDescription: matchedAccommodation.description || "",
+                    DeliveryLocationType: matchedAccommodation.type || "",
+                    DeliveryLocationMinCapacity: matchedAccommodation.minCapacity || 0,
+                    DeliveryLocationMaxCapacity: matchedAccommodation.maxCapacity || 0,
+                    DeliveryLocationPrice: matchedAccommodation.pricePerDay || 0,
+                    DeliveryLocationAmenities: matchedAccommodation.amenities || [],
+                    DeliveryLocationStatus: matchedAccommodation.status || "available",
+                    DeliveryLocationAvatar: matchedAccommodation.avatar?.[0]?.url || "",
+                    DeliveryBookingId: matchedBooking._id,
+                    DeliveryBookingNumber: matchedBooking.bookingNumber || "",
+                },
+
+                timestamp: new Date(),
+            };
+        }
+
+        console.log("\n========================================");
+        console.log("📦 [CHECKOUT] PAYLOADS TO SAVE");
+        console.log("========================================");
+        console.log("🆔 orderId:", orderData.orderId);
+        console.log("👤 userId:", orderData.userId);
+        console.log("📅 orderDate:", orderData.orderDate);
+        console.log("📌 status:", orderData.status);
+        console.log("🧑‍💼 isReceptionist:", isReceptionist);
+        console.log("\n👤 CUSTOMER:");
+        console.log(JSON.stringify(orderData.customer, null, 2));
+        console.log("\n🍔 ITEMS:", orderData.items.length, "item(s)");
+        console.log("\n💰 TOTALS:", JSON.stringify(orderData.totals, null, 2));
+        console.log("\n💳 PAYMENT:", JSON.stringify(orderData.payment, null, 2));
+        console.log("\n🚚 DELIVERY:", JSON.stringify(orderData.delivery, null, 2));
+        if (!isReceptionist) {
+            console.log("\n📍 LOOKUP CHAIN:");
+            console.log("  ActionBooking._id:", matchedBooking?._id);
+            console.log("  → bookingItemId (Accommodation._id):", deliveryLocationId);
+            console.log("  → customerId (UserLogin._id):", bookingCustomerId);
+            console.log("  → linkedId (Customer._id):", customerProfileId);
+            console.log("  → Customer Name:", fullName);
+        } else {
+            console.log("\n📍 WALK-IN ORDER (no booking lookup)");
+        }
+        console.log("========================================\n");
+
+        // ─── Persist order ────────────────────────────────────────
+        const newOrder = await Order.create(orderData);
+
+        // ─── Clear cart (non-fatal if it fails) ───────────────────
+        try {
+            const deletedCart = await Cart.findByIdAndDelete(cartId);
+            if (deletedCart) {
+                console.log(`🗑️ Cart permanently deleted for user: ${userId}`);
+                console.log(`📋 Deleted cart ID: ${deletedCart._id}`);
+            }
+        } catch (err) {
+            console.error("❌ Error deleting cart:", err.message);
+        }
+
+        return res.status(201).json({
+            status: "success",
+            message: "Order placed successfully! Cart has been cleared.",
+            data: newOrder,
+        });
+    } catch (err) {
+        // ─── Global catch — prevents 500 without context ─────────
+        console.error("\n========================================");
+        console.error("❌ [CHECKOUT] UNHANDLED ERROR");
+        console.error("========================================");
+        console.error("Message:", err?.message);
+        console.error("Name:", err?.name);
+        console.error("Stack:", err?.stack);
+        if (err?.errors) {
+            console.error("Validation errors:", JSON.stringify(err.errors, null, 2));
+        }
+        console.error("========================================\n");
+
+        // Mongoose validation error
+        if (err?.name === "ValidationError") {
+            return res.status(400).json({
+                status: "fail",
+                message: "Order validation failed.",
+                errors: Object.keys(err.errors || {}).reduce((acc, key) => {
+                    acc[key] = err.errors[key]?.message;
+                    return acc;
+                }, {}),
+            });
+        }
+
+        // Mongoose duplicate key
+        if (err?.code === 11000) {
+            return res.status(409).json({
+                status: "fail",
+                message: "Duplicate order detected. Please retry.",
+                keyValue: err.keyValue || null,
+            });
+        }
+
+        // Mongoose cast error (invalid ObjectId)
+        if (err?.name === "CastError") {
+            return res.status(400).json({
+                status: "fail",
+                message: `Invalid ${err.path}: ${err.value}`,
+            });
+        }
+
+        return res.status(500).json({
+            status: "fail",
+            message: err?.message || "Checkout failed. Please try again.",
+        });
+    }
 });
 
 exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {

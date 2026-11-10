@@ -244,10 +244,12 @@ const OrderSchema = new mongoose.Schema(
             required: true,
         },
 
+        // ─── OPTIONAL: walk-in orders (Receptionist) may have no deliveryId
         deliveryId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Accommodation",
-            required: true,
+            required: false,
+            default: null,
         },
 
         timestamp: {

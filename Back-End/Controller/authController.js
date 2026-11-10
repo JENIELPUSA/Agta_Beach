@@ -74,7 +74,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       return res.status(400).json({ message: "Emergency contact number must be exactly 11 digits" });
     }
 
-    // ✅ Use .lean() + select only needed field — mas mabilis
+    // Use .lean() + select only needed field — mas mabilis
     const existingUser = await UserLogin.findOne({ username: email })
       .select("_id")
       .lean();
@@ -83,7 +83,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       return res.status(400).json({ message: "User with this email already exists!" });
     }
 
-    // ✅ Run avatar upload in parallel with DB prep (hindi hinihintay agad)
+    //  Run avatar upload in parallel with DB prep (hindi hinihintay agad)
     const avatarPromise = (async () => {
       if (!req.file) return { url: "", public_id: "" };
 
@@ -98,17 +98,17 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
         });
 
         if (response.data.success) {
-          // ✅ Delete temp file asynchronously (non-blocking)
+          //  Delete temp file asynchronously (non-blocking)
           fs.unlink(req.file.path, () => {});
           return { url: response.data.url, public_id: fileName };
         }
       } catch (err) {
-        console.error("❌ Upload failed:", err.message);
+        console.error("Upload failed:", err.message);
       }
       return { url: "", public_id: "" };
     })();
 
-    // ✅ Prepare profile payload habang nag-a-upload
+    //  Prepare profile payload habang nag-a-upload
     const baseProfileData = {
       first_name, last_name, middle_name, email, gender, contact_number, dob, address,
     };
@@ -122,10 +122,10 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       profilePayload = { ...baseProfileData };
     }
 
-    // ✅ Hintayin ang avatar (parallel na nangyari)
+    //  Hintayin ang avatar (parallel na nangyari)
     const avatar = await avatarPromise;
 
-    // ✅ Create profile + user login in parallel (walang dependency sa isa't isa maliban sa linkedId)
+    //  Create profile + user login in parallel (walang dependency sa isa't isa maliban sa linkedId)
     //    Kaya: gumawa muna ng profile, tapos login — pero gamitin ang lean/create options
     const linkedRecord = await (selectedRole === "customer" || selectedRole === "patient"
       ? Customer.create({ avatar, ...profilePayload })
@@ -142,7 +142,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       isVerified: true,
     });
 
-    // ✅ I-respond agad — HUWAG hintayin ang email
+    //  I-respond agad — HUWAG hintayin ang email
     res.status(201).json({
       status: "Success",
       message: "User created successfully",
@@ -150,7 +150,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       profile: linkedRecord,
     });
 
-    // ✅ Fire-and-forget: email + socket emit AFTER response
+    //  Fire-and-forget: email + socket emit AFTER response
     sendEmail({
       email,
       subject: "Your Account Credentials",
@@ -162,7 +162,7 @@ Username: ${email}
 Default Password: ${defaultPassword}
 
 Please change your password after logging in.`,
-    }).catch((err) => console.error("❌ Failed to send signup email:", err.message));
+    }).catch((err) => console.error("Failed to send signup email:", err.message));
 
     const io = req.app.get("io");
     if (io) {
@@ -172,7 +172,7 @@ Please change your password after logging in.`,
       });
     }
   } catch (error) {
-    console.error("❌ Signup failed:", error);
+    console.error("Signup failed:", error);
     res.status(500).json({
       message: "Internal Server Error",
       error: error.message,
@@ -413,7 +413,7 @@ exports.login = AsyncErrorHandler(async (req, res, next) => {
         console.warn("⚠️ No valid items in order data, cart not created.");
       }
     } catch (error) {
-      console.error("❌ Failed to process cart during login:", error);
+      console.error("Failed to process cart during login:", error);
       // Don't block login, just log the error
     }
   }
@@ -579,12 +579,12 @@ exports.resetPassword = AsyncErrorHandler(async (req, res, next) => {
 
 exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
   try {
-    // ✅ DEBUG — tingnan kung ano ang dumarating
+    //  DEBUG — tingnan kung ano ang dumarating
     console.log("🔍 UPDATE PASSWORD BODY:", req.body);
 
     const { currentPassword, newPassword, confirmNewPassword } = req.body;
 
-    // ✅ Validation
+    //  Validation
     if (!currentPassword) {
       return next(new CustomError("Current password is required.", 400));
     }
@@ -605,7 +605,7 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
       return next(new CustomError("User not found.", 404));
     }
 
-    // ✅ Compare current password
+    //  Compare current password
     const isMatch = await user.comparePasswordInDb(
       currentPassword,
       user.password
@@ -617,7 +617,7 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
       );
     }
 
-    // ✅ I-set ang BAGONG password
+    //  I-set ang BAGONG password
     user.password = newPassword;
     user.confirmPassword = confirmNewPassword;
 
@@ -625,7 +625,7 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
 
     const token = signToken(user._id);
 
-    // ✅ Alisin ang sensitive fields sa response
+    //  Alisin ang sensitive fields sa response
     user.password = undefined;
     user.confirmPassword = undefined;
 
@@ -635,7 +635,7 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
       data: { user },
     });
   } catch (error) {
-    console.error("❌ UPDATE PASSWORD ERROR:", error);
+    console.error("UPDATE PASSWORD ERROR:", error);
     return next(
       new CustomError(
         error.message || "Failed to update password. Please try again.",
@@ -727,7 +727,7 @@ exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   }
 
   // ============================================================
-  // 10. ✅ Validate: Active status lang
+  // 10.  Validate: Active status lang
   //     UPDATED: CheckIn na (dati: Confirmed)
   // ============================================================
   const activeStatuses = ["Pending", "CheckIn", "waiting", "Paid"];
@@ -743,7 +743,7 @@ exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   }
 
   // ============================================================
-  // 11. ✅ Validate: Hindi pa tapos (isDone)
+  // 11.  Validate: Hindi pa tapos (isDone)
   // ============================================================
   if (booking.isDone) {
     return next(
@@ -752,14 +752,14 @@ exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   }
 
   // ============================================================
-  // 12. ✅ I-UNSET ang lahat ng existing setdefault: true ng user
+  // 12.  I-UNSET ang lahat ng existing setdefault: true ng user
   //     (para isa lang ang default)
   // ============================================================
   await ActionBooking.updateMany(
     {
       customerId: user._id,
-      _id: { $ne: booking._id },      // ✅ Huwag galawin ang bagong default
-      setdefault: true,               // ✅ Yung may default lang
+      _id: { $ne: booking._id },      //  Huwag galawin ang bagong default
+      setdefault: true,               //  Yung may default lang
     },
     {
       $set: { setdefault: false },
@@ -767,7 +767,7 @@ exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   );
 
   // ============================================================
-  // 13. ✅ I-SET ang bagong default sa ActionBooking
+  // 13.  I-SET ang bagong default sa ActionBooking
   // ============================================================
   const updatedBooking = await ActionBooking.findByIdAndUpdate(
     booking._id,
@@ -788,7 +788,7 @@ exports.setdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   }
 
   console.log(
-    "✅ [setdefaultlocation] Default set on booking:",
+    " [setdefaultlocation] Default set on booking:",
     updatedBooking.bookingNumber
   );
 
@@ -830,35 +830,35 @@ exports.Getdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
   }
 
   // ============================================================
-  // ✅ AGGREGATION with $lookup
+  //  AGGREGATION with $lookup
   // ============================================================
   const result = await UserLogin.aggregate([
-    // ✅ 1. Hanapin ang user via linkedId
+    //  1. Hanapin ang user via linkedId
     {
       $match: {
         linkedId: new mongoose.Types.ObjectId(linkId),
       },
     },
 
-    // ✅ 2. $lookup — i-join ang ActionBooking via isdefaultlocation
+    //  2. $lookup — i-join ang ActionBooking via isdefaultlocation
     {
       $lookup: {
-        from: "actionbookings",              // ✅ collection name (lowercase + plural)
+        from: "actionbookings",              //  collection name (lowercase + plural)
         localField: "isdefaultlocation",     // field sa UserLogin
         foreignField: "_id",                 // field sa ActionBooking
         as: "defaultLocationData",           // output array
       },
     },
 
-    // ✅ 3. Kunin ang unang item mula sa array (or null)
+    //  3. Kunin ang unang item mula sa array (or null)
     {
       $unwind: {
         path: "$defaultLocationData",
-        preserveNullAndEmptyArrays: true,   // ✅ keep user kahit walang match
+        preserveNullAndEmptyArrays: true,   //  keep user kahit walang match
       },
     },
 
-    // ✅ 4. Project — id + locationName lang
+    //  4. Project — id + locationName lang
     {
       $project: {
         _id: 0,
@@ -879,7 +879,7 @@ exports.Getdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
                 ],
               },
             },
-            else: null,   // ✅ null kapag walang default
+            else: null,   //  null kapag walang default
           },
         },
       },
@@ -888,16 +888,16 @@ exports.Getdefaultlocation = AsyncErrorHandler(async (req, res, next) => {
 
   console.log("🔍 [Getdefaultlocation] aggregation result:", result);
 
-  // ✅ Kung walang user
+  //  Kung walang user
   if (!result || result.length === 0) {
     return next(new CustomError("User not found.", 404));
   }
 
   const displayData = result[0].isdefaultlocation;
 
-  console.log("✅ [Getdefaultlocation] Display data:", displayData);
+  console.log(" [Getdefaultlocation] Display data:", displayData);
 
-  // ✅ 5. Return success
+  //  5. Return success
   res.status(200).json({
     status: "success",
     data: {
