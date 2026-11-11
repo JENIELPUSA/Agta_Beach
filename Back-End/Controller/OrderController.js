@@ -23,7 +23,12 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
             notes,
             defaultLocationId,
             items = [],
-            _isReceptionist, // optional flag from frontend
+            _isReceptionist,
+
+            // ✅ NEW fields from the checkout modal
+            customerName: bodyCustomerName,
+            orderType: bodyOrderType,
+            deliveryLocation: bodyDeliveryLocation,
         } = req.body;
 
         console.log("📥 req.body:", req.body);
@@ -38,6 +43,31 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
         if (!payment) {
             return res.status(400).json({ status: "fail", message: "Payment details are required." });
         }
+
+        // ─── ✅ NEW: Validate new required fields ────────────────
+        if (!bodyCustomerName || !String(bodyCustomerName).trim()) {
+            return res.status(400).json({
+                status: "fail",
+                message: "Customer name is required.",
+            });
+        }
+        if (!bodyDeliveryLocation || !String(bodyDeliveryLocation).trim()) {
+            return res.status(400).json({
+                status: "fail",
+                message: "Delivery location is required.",
+            });
+        }
+
+        const validOrderTypes = ["dine-in", "take-out", "walk-in"];
+        const normalizedOrderType = String(bodyOrderType || "dine-in")
+            .trim()
+            .toLowerCase();
+        const resolvedOrderType = validOrderTypes.includes(normalizedOrderType)
+            ? normalizedOrderType
+            : "dine-in";
+
+        const trimmedCustomerName = String(bodyCustomerName).trim();
+        const trimmedDeliveryLocation = String(bodyDeliveryLocation).trim();
 
         // ─── Resolve Receptionist flag ────────────────────────────
         let isReceptionist = _isReceptionist === true;
@@ -57,6 +87,9 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
         }
 
         console.log("🧑‍💼 [CHECKOUT] Is Receptionist:", isReceptionist);
+        console.log("🧾 [CHECKOUT] Customer Name:", trimmedCustomerName);
+        console.log("🍽️ [CHECKOUT] Order Type:", resolvedOrderType);
+        console.log("📍 [CHECKOUT] Delivery Location:", trimmedDeliveryLocation);
 
         // ─── Location requirement (skipped for Receptionist) ─────
         if (!isReceptionist && !defaultLocationId) {
@@ -185,8 +218,6 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
             // ----- Receptionist flow (walk-in order) -----
             console.log("🧑‍💼 [CHECKOUT] Receptionist walk-in order — skipping booking/accommodation lookup.");
 
-            // Optional: still try to resolve the receptionist's own profile
-            // (for logging / audit trail). Failure is non-fatal.
             try {
                 const requester = await UserLogin.findById(userId)
                     .select("_id linkedId role")
@@ -262,16 +293,28 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
         let orderData;
 
         if (isReceptionist) {
+            // For receptionist we respect whatever orderType they picked
+            // (dine-in / take-out), falling back to "walk-in" only if not provided.
+            const receptionistOrderType =
+                resolvedOrderType === "walk-in"
+                    ? "walk-in"
+                    : resolvedOrderType || "walk-in";
+
             orderData = {
                 orderId,
                 userId,
                 orderDate: new Date(),
                 status: "pending",
 
+                // ✅ NEW top-level fields
+                customerName: trimmedCustomerName || fullName || "Walk-in Guest",
+                orderType: receptionistOrderType,
+                deliveryLocation: trimmedDeliveryLocation || "Walk-in",
+
                 customer: {
                     id: userId,
-                    name: fullName || "Walk-in Guest",
-                    room: "Walk-in",
+                    name: trimmedCustomerName || fullName || "Walk-in Guest",
+                    room: trimmedDeliveryLocation || "Walk-in",
                     status: "walk-in",
                     points: 0,
                     checkOut: "",
@@ -292,18 +335,17 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
                     currency: payment.currency || "PHP",
                 },
 
-                // No deliveryId — walk-in
                 deliveryId: null,
 
                 delivery: {
-                    type: "walk-in",
-                    roomNumber: "Walk-in",
+                    type: receptionistOrderType,
+                    roomNumber: trimmedDeliveryLocation || "Walk-in",
                     status: "pending",
                     notes: delivery?.notes || notes || "",
                     DeliveryLocationId: null,
-                    DeliveryLocationName: "Walk-in",
+                    DeliveryLocationName: trimmedDeliveryLocation || "Walk-in",
                     DeliveryLocationDescription: "",
-                    DeliveryLocationType: "walk-in",
+                    DeliveryLocationType: receptionistOrderType,
                     DeliveryLocationMinCapacity: 0,
                     DeliveryLocationMaxCapacity: 0,
                     DeliveryLocationPrice: 0,
@@ -317,16 +359,23 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
                 timestamp: new Date(),
             };
         } else {
+            // Guest order — honor the selected orderType (dine-in / take-out)
             orderData = {
                 orderId,
                 userId,
                 orderDate: new Date(),
                 status: "pending",
 
+                // ✅ NEW top-level fields
+                customerName: trimmedCustomerName || fullName || "",
+                orderType: resolvedOrderType,
+                deliveryLocation:
+                    trimmedDeliveryLocation || matchedAccommodation.name || "",
+
                 customer: {
                     id: matchedUserLogin._id,
-                    name: fullName || "",
-                    room: matchedAccommodation.name || "",
+                    name: trimmedCustomerName || fullName || "",
+                    room: trimmedDeliveryLocation || matchedAccommodation.name || "",
                     status: matchedBooking.status || "",
                     points: 0,
                     checkOut: "",
@@ -350,11 +399,18 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
                 deliveryId: deliveryLocationId,
 
                 delivery: {
-                    roomNumber: matchedAccommodation.name || "",
+                    type: resolvedOrderType, // "dine-in" | "take-out"
+                    roomNumber:
+                        trimmedDeliveryLocation ||
+                        matchedAccommodation.name ||
+                        "",
                     status: "pending",
                     notes: delivery?.notes || notes || "",
                     DeliveryLocationId: deliveryLocationId,
-                    DeliveryLocationName: matchedAccommodation.name || "",
+                    DeliveryLocationName:
+                        trimmedDeliveryLocation ||
+                        matchedAccommodation.name ||
+                        "",
                     DeliveryLocationDescription: matchedAccommodation.description || "",
                     DeliveryLocationType: matchedAccommodation.type || "",
                     DeliveryLocationMinCapacity: matchedAccommodation.minCapacity || 0,
@@ -379,6 +435,9 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
         console.log("📅 orderDate:", orderData.orderDate);
         console.log("📌 status:", orderData.status);
         console.log("🧑‍💼 isReceptionist:", isReceptionist);
+        console.log("🧾 customerName:", orderData.customerName);
+        console.log("🍽️ orderType:", orderData.orderType);
+        console.log("📍 deliveryLocation:", orderData.deliveryLocation);
         console.log("\n👤 CUSTOMER:");
         console.log(JSON.stringify(orderData.customer, null, 2));
         console.log("\n🍔 ITEMS:", orderData.items.length, "item(s)");
@@ -417,7 +476,6 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
             data: newOrder,
         });
     } catch (err) {
-        // ─── Global catch — prevents 500 without context ─────────
         console.error("\n========================================");
         console.error("❌ [CHECKOUT] UNHANDLED ERROR");
         console.error("========================================");
@@ -429,7 +487,6 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
         }
         console.error("========================================\n");
 
-        // Mongoose validation error
         if (err?.name === "ValidationError") {
             return res.status(400).json({
                 status: "fail",
@@ -441,7 +498,6 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
             });
         }
 
-        // Mongoose duplicate key
         if (err?.code === 11000) {
             return res.status(409).json({
                 status: "fail",
@@ -450,7 +506,6 @@ exports.checkout = AsyncErrorHandler(async (req, res) => {
             });
         }
 
-        // Mongoose cast error (invalid ObjectId)
         if (err?.name === "CastError") {
             return res.status(400).json({
                 status: "fail",
@@ -482,11 +537,17 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             startDate = "",
             endDate = "",
             sort = "new",
+
+            // ✅ NEW filters
+            orderType = "",
+            deliveryLocation = "",
         } = req.query;
 
         console.log("Role:", role);
         console.log("Sort:", sort);
         console.log("Status Filter:", status);
+        console.log("Order Type Filter:", orderType);
+        console.log("Delivery Location Filter:", deliveryLocation);
 
         const matchStage = {};
 
@@ -498,11 +559,18 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             matchStage.userId = new mongoose.Types.ObjectId(userId);
         }
 
+        // ─── ✅ Search now includes customerName, deliveryLocation, orderType
         if (search.trim()) {
+            const re = new RegExp(search.trim(), "i");
             matchStage.$or = [
-                { orderId: { $regex: new RegExp(search.trim(), "i") } },
-                { "customer.name": { $regex: new RegExp(search.trim(), "i") } },
-                { "customer.room": { $regex: new RegExp(search.trim(), "i") } },
+                { orderId: re },
+                { customerName: re },           // ✅ NEW top-level
+                { deliveryLocation: re },       // ✅ NEW top-level
+                { orderType: re },              // ✅ NEW top-level
+                { "customer.name": re },        // legacy
+                { "customer.room": re },        // legacy
+                { "delivery.roomNumber": re },
+                { "delivery.DeliveryLocationName": re },
             ];
         }
 
@@ -527,6 +595,27 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
 
         if (deliveryStatus.trim()) {
             matchStage["delivery.status"] = deliveryStatus;
+        }
+
+        // ─── ✅ NEW: Filter by order type (supports comma-list)
+        if (orderType.trim()) {
+            const orderTypeList = orderType
+                .split(",")
+                .map((s) => s.trim().toLowerCase())
+                .filter(Boolean);
+
+            if (orderTypeList.length === 1) {
+                matchStage.orderType = orderTypeList[0];
+            } else if (orderTypeList.length > 1) {
+                matchStage.orderType = { $in: orderTypeList };
+            }
+        }
+
+        // ─── ✅ NEW: Filter by delivery location (partial match)
+        if (deliveryLocation.trim()) {
+            matchStage.deliveryLocation = {
+                $regex: new RegExp(deliveryLocation.trim(), "i"),
+            };
         }
 
         if (startDate.trim() && endDate.trim()) {
@@ -554,6 +643,34 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
                     data: [
                         { $skip: skip },
                         { $limit: limit },
+                        // ─── ✅ Normalize new fields so frontend always receives them
+                        {
+                            $addFields: {
+                                // customerName: prefer top-level → fallback to customer.name
+                                customerName: {
+                                    $ifNull: [
+                                        "$customerName",
+                                        "$customer.name",
+                                    ],
+                                },
+                                // deliveryLocation: prefer top-level → fallback chain
+                                deliveryLocation: {
+                                    $ifNull: [
+                                        "$deliveryLocation",
+                                        "$delivery.DeliveryLocationName",
+                                        "$customer.room",
+                                    ],
+                                },
+                                // orderType: prefer top-level → fallback to delivery.type
+                                orderType: {
+                                    $ifNull: [
+                                        "$orderType",
+                                        "$delivery.type",
+                                        "dine-in",
+                                    ],
+                                },
+                            },
+                        },
                         {
                             $lookup: {
                                 from: "userlogins",
@@ -622,7 +739,32 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             { $group: { _id: "$payment.status", count: { $sum: 1 } } },
         ]);
 
+        // ─── ✅ NEW: orderType breakdown counts
+        const orderTypeCountsRaw = await Order.aggregate([
+            { $match: matchStage },
+            { $group: { _id: "$orderType", count: { $sum: 1 } } },
+        ]);
+
+        const orderTypeCounts = {
+            "dine-in": 0,
+            "take-out": 0,
+            "walk-in": 0,
+        };
+
+        orderTypeCountsRaw.forEach((item) => {
+            const key = (item._id || "").toLowerCase().replace(/[\s_]/g, "-");
+            if (orderTypeCounts[key] !== undefined) {
+                orderTypeCounts[key] = item.count;
+            }
+        });
+
         const statuses = await Order.distinct("status", matchStage);
+
+        // ─── ✅ NEW: distinct orderTypes + delivery locations (for filter dropdowns)
+        const orderTypes = await Order.distinct("orderType", matchStage);
+        const deliveryLocations = (
+            await Order.distinct("deliveryLocation", matchStage)
+        ).filter(Boolean);
 
         return res.status(200).json({
             success: true,
@@ -640,12 +782,19 @@ exports.DisplayOrders = AsyncErrorHandler(async (req, res) => {
             statusCounts,
             paymentStatusCounts,
             statuses,
+            // ✅ NEW aggregations for frontend filter UI
+            orderTypeCounts,
+            orderTypes,
+            deliveryLocations,
             debug: {
                 role,
                 userId: role === "customer" ? userId?.toString() : null,
                 filterApplied: role === "customer" ? "Own Orders" : "All Orders",
                 sortApplied: sort,
                 statusFilterApplied: status || null,
+                orderTypeFilterApplied: orderType || null,           // ✅ NEW
+                deliveryLocationFilterApplied: deliveryLocation || null, // ✅ NEW
+                searchApplied: search || null,                       // ✅ NEW
                 totalMatchingOrders,
                 allOrdersCount,
                 hasOrders: allOrdersCount > 0,

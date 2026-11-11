@@ -224,6 +224,29 @@ const OrderSchema = new mongoose.Schema(
             default: [],
         },
 
+        // ─── ✅ NEW: Customer name (from checkout modal)
+        customerName: {
+            type: String,
+            required: true,
+            trim: true,
+        },
+
+        // ─── ✅ NEW: Order type (dine-in / take-out / walk-in)
+        orderType: {
+            type: String,
+            enum: ["dine-in", "take-out", "walk-in"],
+            default: "dine-in",
+            required: true,
+        },
+
+        // ─── ✅ NEW: Delivery location (free text or accommodation name)
+        deliveryLocation: {
+            type: String,
+            required: true,
+            trim: true,
+            default: "",
+        },
+
         customer: {
             type: CustomerSchema,
             required: true,

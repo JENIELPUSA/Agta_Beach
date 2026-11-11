@@ -735,7 +735,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     // COMPUTE DISPLAY AMOUNT
     {
       $addFields: {
-        //  Gamitin ang totalPrice kung mayroon, else itemPrice
         originalAmount: {
           $cond: {
             if: { $gt: ["$totalPrice", 0] },
@@ -844,7 +843,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         checkOut: 1,
         expected_stay: 1,
 
-        //  BAGONG FIELDS
         unitPrice: 1,
         isWeekend: 1,
         totalPrice: 1,
@@ -885,6 +883,10 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         billingHistoryCount: 1,
         hasPartial: 1,
         hasFullyPaid: 1,
+
+        // ✅ NEW fields (Bookings won't have them, so we set defaults)
+        orderType: { $literal: null },
+        deliveryLocation: { $literal: null },
       },
     },
   ]);
@@ -1078,7 +1080,22 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
 
     {
       $addFields: {
-        customerName: "$user.name",
+        // ✅ NEW: normalize new fields with fallbacks for legacy orders
+        resolvedCustomerName: {
+          $ifNull: ["$customerName", "$user.name"],
+        },
+        resolvedOrderType: {
+          $ifNull: ["$orderType", "$delivery.type"],
+        },
+        resolvedDeliveryLocation: {
+          $ifNull: [
+            "$deliveryLocation",
+            "$delivery.DeliveryLocationName",
+            "$customer.room",
+          ],
+        },
+
+        customerName: { $ifNull: ["$customerName", "$user.name"] },
         customerEmail: "$user.email",
         itemCount: { $size: "$items" },
         latestPartial: { $arrayElemAt: ["$partialBilling", 0] },
@@ -1200,14 +1217,15 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         orderStatus: "$status",
         deliveryStatus: "$delivery.status",
         createdAt: "$orderDate",
+
         customer: {
           _id: "$user._id",
-          name: "$user.name",
+          name: { $ifNull: ["$customerName", "$user.name"] },
           email: "$user.email",
           avatar: "$user.avatar",
           image: "$user.image",
         },
-        customerName: 1,
+        customerName: { $ifNull: ["$customerName", "$user.name"] },
         customerEmail: 1,
         orderId: 1,
         items: 1,
@@ -1229,6 +1247,19 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         billingHistoryCount: 1,
         hasPartial: 1,
         hasFullyPaid: 1,
+
+        // ✅ NEW FIELDS
+        orderType: {
+          $ifNull: ["$orderType", "$delivery.type", "dine-in"],
+        },
+        deliveryLocation: {
+          $ifNull: [
+            "$deliveryLocation",
+            "$delivery.DeliveryLocationName",
+            "$customer.room",
+            "",
+          ],
+        },
       },
     },
   ]);
@@ -1269,6 +1300,13 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     return acc;
   }, {});
 
+  // ✅ NEW: breakdown ng orders by orderType
+  const orderTypeCounts = orders.reduce((acc, item) => {
+    const key = item.orderType || "unknown";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
   res.status(200).json({
     success: true,
     summary: {
@@ -1277,6 +1315,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
       grandTotal: bookingTotal + orderTotal,
       totalBookings: bookings.length,
       totalOrders: orders.length,
+
+      // ✅ NEW
+      orderTypeCounts,
     },
     statusSummary: {
       booking: bookingStatusCounts,
