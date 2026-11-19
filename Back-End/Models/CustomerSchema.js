@@ -12,6 +12,16 @@ const customerSchema = new mongoose.Schema({
   gender: { type: String, enum: ["Male", "Female"] },
   email: String,
   created_at: { type: Date, default: Date.now },
+  imageId: {
+    front: {
+      url: String,
+      public_id: String,
+    },
+    back: {
+      url: String,
+      public_id: String,
+    },
+  },
 });
 
 module.exports = mongoose.model("Customer", customerSchema);

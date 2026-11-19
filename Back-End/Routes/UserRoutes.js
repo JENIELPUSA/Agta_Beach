@@ -6,7 +6,7 @@ const authController = require('./../Controller/authController')
 router.route('/')
     .get(userController.DisplayAll)
     .post(authController.protect,userController.createUser)
-    
+
 
 router.route('/:id')
     .delete(authController.protect,authController.restrict('Admin'),userController.deleteUser)

@@ -10,16 +10,15 @@ const UserLoginSchema = new mongoose.Schema(
       public_id: String,
     },
     first_name: { type: String, trim: true },
-    middle_name: { type: String, trim: true },      // ✅ BAGO
+    middle_name: { type: String, trim: true },   
     last_name: { type: String, trim: true },
-    suffix: { type: String, trim: true },           // ✅ BAGO
-    contact_number: { type: String, trim: true },   // ✅ String (para sa leading 0)
+    suffix: { type: String, trim: true },           
 
-    email: {                                          // ✅ BAGO
+    email: {                                       
       type: String,
-      required: false,      // gawing false muna para hindi mag-break sa existing data
+      required: false,      
       unique: true,
-      sparse: true,         // ✅ para hindi mag-error sa null emails
+      sparse: true,         
       lowercase: true,
       trim: true,
       validate: {

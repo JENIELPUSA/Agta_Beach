@@ -7,6 +7,183 @@ const Rental = require("../Models/rentalSchema");
 const BookingItem = require("../Models/bookingItemSchema");
 const ActionBookingScheema = require("../Models/ActionBooking");
 
+exports.displayAllOffersController = async (req, res) => {
+  try {
+    const {
+      // Global defaults
+      search = "",
+      page = 1,
+      limit = 10,
+
+      // Filters (shared sa lahat)
+      status,
+      category,
+
+      // ── Per-collection pagination (optional) ──
+      accPage,
+      accLimit,
+      svcPage,
+      svcLimit,
+      rentPage,
+      rentLimit,
+
+      // ── Accommodation-specific filter ──
+      type,
+    } = req.query;
+
+    // ─── Helper: sanitize pagination ──────────────────────────
+    const sanitizePage = (val, fallback) =>
+      Math.max(1, parseInt(val, 10) || fallback);
+
+    const sanitizeLimit = (val, fallback) =>
+      Math.min(100, Math.max(1, parseInt(val, 10) || fallback));
+
+    const globalPage = sanitizePage(page, 1);
+    const globalLimit = sanitizeLimit(limit, 10);
+
+    const accP = sanitizePage(accPage, globalPage);
+    const accL = sanitizeLimit(accLimit, globalLimit);
+    const svcP = sanitizePage(svcPage, globalPage);
+    const svcL = sanitizeLimit(svcLimit, globalLimit);
+    const rentP = sanitizePage(rentPage, globalPage);
+    const rentL = sanitizeLimit(rentLimit, globalLimit);
+
+    // ─── Helper: build query ──────────────────────────────────
+    const buildQuery = (extra = {}) => {
+      const q = { ...extra };
+      if (search.trim()) {
+        const escaped = search
+          .trim()
+          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        q.name = { $regex: escaped, $options: "i" };
+      }
+      if (status) q.status = status;
+      return q;
+    };
+
+    // ─── Build per-collection queries ─────────────────────────
+    const accQuery = buildQuery({});
+    if (type) accQuery.type = type;
+
+    const svcQuery = buildQuery();
+    if (category) svcQuery.category = category;
+
+    const rentQuery = buildQuery();
+
+    // ─── Execute all queries in parallel ──────────────────────
+    const [
+      notCheckedOutBookings,
+      accTotal,
+      svcTotal,
+      rentTotal,
+      accommodations,
+      services,
+      rentals,
+    ] = await Promise.all([
+      ActionBookingScheema.find({
+        bookingItemModel: "Accommodation",
+        status: { $nin: ["CheckedOut", "Cancelled", "Rejected"] },
+      })
+        .select("bookingItemId status")
+        .lean(),
+
+      Accommodation.countDocuments(accQuery),
+      Service.countDocuments(svcQuery),
+      Rental.countDocuments(rentQuery),
+
+      Accommodation.find(accQuery)
+        .sort({ createdAt: -1 })
+        .skip((accP - 1) * accL)
+        .limit(accL)
+        .lean(),
+
+      Service.find(svcQuery)
+        .sort({ createdAt: -1 })
+        .skip((svcP - 1) * svcL)
+        .limit(svcL)
+        .lean(),
+
+      Rental.find(rentQuery)
+        .sort({ createdAt: -1 })
+        .skip((rentP - 1) * rentL)
+        .limit(rentL)
+        .lean(),
+    ]);
+
+    const notCheckedOutIds = new Set(
+      (notCheckedOutBookings || [])
+        .map((b) => b?.bookingItemId?.toString())
+        .filter(Boolean)
+    );
+
+    const updatedAccommodations = (accommodations || []).map((item) => {
+      const id = item?._id?.toString();
+      const isNotCheckedOut = id && notCheckedOutIds.has(id);
+      const isMaintenance = item?.status === "maintenance";
+
+      return {
+        ...item,
+        availabilityStatus: isMaintenance
+          ? "Maintenance"
+          : isNotCheckedOut
+            ? "Not Available"
+            : "Available",
+      };
+    });
+
+    console.log("updatedAccommodations",updatedAccommodations)
+
+
+    const updatedServices = (services || []).map((item) => ({
+      ...item,
+      availabilityStatus: item?.availabilityStatus || "Available",
+    }));
+
+    const updatedRentals = (rentals || []).map((item) => ({
+      ...item,
+      availabilityStatus: item?.availabilityStatus || "Available",
+    }));
+
+    // ─── Response ─────────────────────────────────────────────
+    res.status(200).json({
+      success: true,
+      pagination: {
+        accommodations: {
+          currentPage: accP,
+          limit: accL,
+          totalRecords: accTotal,
+          totalPages: Math.ceil(accTotal / accL) || 0,
+        },
+        services: {
+          currentPage: svcP,
+          limit: svcL,
+          totalRecords: svcTotal,
+          totalPages: Math.ceil(svcTotal / svcL) || 0,
+        },
+        rentals: {
+          currentPage: rentP,
+          limit: rentL,
+          totalRecords: rentTotal,
+          totalPages: Math.ceil(rentTotal / rentL) || 0,
+        },
+      },
+      counts: {
+        accommodations: accTotal,
+        services: svcTotal,
+        rentals: rentTotal,
+      },
+      data: {
+        accommodations: updatedAccommodations,
+        services: updatedServices,
+        rentals: updatedRentals,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Server Error 500:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 exports.displayAllLimitOffers = async (req, res) => {
   try {
     const {
@@ -32,8 +209,8 @@ exports.displayAllLimitOffers = async (req, res) => {
       if (Number.isNaN(n) || n < 1) return fallback;
       return Math.min(100, n);
     };
-    const accL  = sanitizeLimit(accLimit, 4);
-    const svcL  = sanitizeLimit(svcLimit, 8);
+    const accL = sanitizeLimit(accLimit, 4);
+    const svcL = sanitizeLimit(svcLimit, 8);
     const rentL = sanitizeLimit(rentLimit, 10);
 
     // ─── Helper: build query + cursor ─────────────────────────
@@ -48,15 +225,18 @@ exports.displayAllLimitOffers = async (req, res) => {
     };
 
     // ─── Build per-collection queries ─────────────────────────
-    const accQuery  = buildQuery({ type: type || "room" }, cursorAcc);
-    const svcQuery  = buildQuery(category ? { category } : {}, cursorSvc);
+    const accQuery = buildQuery({ type: type || "room" }, cursorAcc);
+    const svcQuery = buildQuery(category ? { category } : {}, cursorSvc);
     const rentQuery = buildQuery({}, cursorRent);
 
-    // ─── Fetch paid bookings + next slices in parallel ────────
-    // +1 trick para malaman kung may next pa
-    const [paidBookings, accDocs, svcDocs, rentDocs] = await Promise.all([
-      ActionBookingScheema.find({ status: "Paid" })
-        .select("bookingItemId bookingItemModel")
+    // ─── Fetch active bookings + next slices in parallel ──────
+    // ⬅️ ITO ANG BINAGO: dating { status: "Paid" }, ngayon active bookings
+    const [notCheckedOutBookings, accDocs, svcDocs, rentDocs] = await Promise.all([
+      ActionBookingScheema.find({
+        bookingItemModel: "Accommodation",
+        status: { $nin: ["CheckedOut", "Cancelled", "Rejected"] },
+      })
+        .select("bookingItemId status")
         .lean(),
 
       Accommodation.find(accQuery).sort({ createdAt: -1 }).limit(accL + 1).lean(),
@@ -69,33 +249,41 @@ exports.displayAllLimitOffers = async (req, res) => {
       const hasMore = docs.length > limit;
       return { items: hasMore ? docs.slice(0, limit) : docs, hasMore };
     };
-    const accPage  = slicePage(accDocs,  accL);
-    const svcPage  = slicePage(svcDocs,  svcL);
+    const accPage = slicePage(accDocs, accL);
+    const svcPage = slicePage(svcDocs, svcL);
     const rentPage = slicePage(rentDocs, rentL);
 
-    // ─── Build paidMap ────────────────────────────────────────
-    const paidMap = new Map();
-    (paidBookings || []).forEach((item) => {
-      if (!item?.bookingItemId) return;
-      paidMap.set(item.bookingItemId.toString(), item.bookingItemModel);
-    });
+    // ─── Build notCheckedOutIds set ───────────────────────────
+    // ⬅️ ITO ANG BINAGO: dating paidMap, ngayon Set ng active booking IDs
+    const notCheckedOutIds = new Set(
+      (notCheckedOutBookings || [])
+        .map((b) => b?.bookingItemId?.toString())
+        .filter(Boolean)
+    );
 
     // ─── Helper: update availabilityStatus ────────────────────
-    const updateStatus = (items, modelName) => {
+    // ⬅️ ITO ANG BINAGO: 3-state logic tulad ng displayAllOffersController
+    const updateStatus = (items) => {
       if (!Array.isArray(items)) return [];
       return items.map((item) => {
         const id = item?._id?.toString();
-        const isPaid = id && paidMap.has(id) && paidMap.get(id) === modelName;
+        const isNotCheckedOut = id && notCheckedOutIds.has(id);
+        const isMaintenance = item?.status === "maintenance";
+
         return {
           ...item,
-          availabilityStatus: isPaid ? "Not Available" : "Available",
+          availabilityStatus: isMaintenance
+            ? "Maintenance"
+            : isNotCheckedOut
+              ? "Not Available"
+              : "Available",
         };
       });
     };
 
-    const updatedAccommodations = updateStatus(accPage.items, "Accommodation");
-    const updatedServices       = updateStatus(svcPage.items, "Service");
-    const updatedRentals        = updateStatus(rentPage.items, "Rental");
+    const updatedAccommodations = updateStatus(accPage.items);
+    const updatedServices = updateStatus(svcPage.items);
+    const updatedRentals = updateStatus(rentPage.items);
 
     // ─── Build nextCursor per collection ──────────────────────
     const makeCursor = (items, hasMore) => {
@@ -607,146 +795,6 @@ exports.searchAvailableRooms = async (req, res) => {
   } catch (err) {
     console.error("❌ Search Error:", err);
     res.status(500).json({ success: false, message: "Server error" });
-  }
-};
-
-// =========================================
-//  DISPLAY ALL OFFERS
-//  — may SEPARATE pagination per collection
-// =========================================
-exports.displayAllOffersController = async (req, res) => {
-  try {
-    const {
-      // Global defaults
-      search = "",
-      page = 1,
-      limit = 10,
-
-      // Filters (shared sa lahat)
-      status,
-      category,
-
-      // ── Per-collection pagination (optional) ──
-      // Kung hindi ibinigay, gagamitin ang global page/limit
-      accPage,
-      accLimit,
-      svcPage,
-      svcLimit,
-      rentPage,
-      rentLimit,
-
-      // ── Accommodation-specific filter ──
-      type, // para sa accommodation only (room, villa, etc.)
-    } = req.query;
-
-    // ─── Helper: sanitize pagination ──────────────────────────
-    const sanitizePage = (val, fallback) =>
-      Math.max(1, parseInt(val, 10) || fallback);
-
-    const sanitizeLimit = (val, fallback) =>
-      Math.min(100, Math.max(1, parseInt(val, 10) || fallback));
-
-    const globalPage = sanitizePage(page, 1);
-    const globalLimit = sanitizeLimit(limit, 10);
-
-    const accP = sanitizePage(accPage, globalPage);
-    const accL = sanitizeLimit(accLimit, globalLimit);
-    const svcP = sanitizePage(svcPage, globalPage);
-    const svcL = sanitizeLimit(svcLimit, globalLimit);
-    const rentP = sanitizePage(rentPage, globalPage);
-    const rentL = sanitizeLimit(rentLimit, globalLimit);
-
-    // ─── Helper: build query ──────────────────────────────────
-    const buildQuery = (extra = {}) => {
-      const q = { ...extra };
-      if (search.trim()) {
-        const escaped = search
-          .trim()
-          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        q.name = { $regex: escaped, $options: "i" };
-      }
-      if (status) q.status = status;
-      return q;
-    };
-
-    // ─── Build per-collection queries ─────────────────────────
-    const accQuery = buildQuery({});
-    if (type) accQuery.type = type;
-
-    const svcQuery = buildQuery();
-    if (category) svcQuery.category = category;
-
-    const rentQuery = buildQuery();
-
-    // ─── Execute all queries in parallel ──────────────────────
-    const [
-      accTotal,
-      svcTotal,
-      rentTotal,
-      accommodations,
-      services,
-      rentals,
-    ] = await Promise.all([
-      Accommodation.countDocuments(accQuery),
-      Service.countDocuments(svcQuery),
-      Rental.countDocuments(rentQuery),
-
-      Accommodation.find(accQuery)
-        .sort({ createdAt: -1 })
-        .skip((accP - 1) * accL)
-        .limit(accL)
-        .lean(),
-
-      Service.find(svcQuery)
-        .sort({ createdAt: -1 })
-        .skip((svcP - 1) * svcL)
-        .limit(svcL)
-        .lean(),
-
-      Rental.find(rentQuery)
-        .sort({ createdAt: -1 })
-        .skip((rentP - 1) * rentL)
-        .limit(rentL)
-        .lean(),
-    ]);
-
-    // ─── Response ─────────────────────────────────────────────
-    res.status(200).json({
-      success: true,
-      pagination: {
-        accommodations: {
-          currentPage: accP,
-          limit: accL,
-          totalRecords: accTotal,
-          totalPages: Math.ceil(accTotal / accL) || 0,
-        },
-        services: {
-          currentPage: svcP,
-          limit: svcL,
-          totalRecords: svcTotal,
-          totalPages: Math.ceil(svcTotal / svcL) || 0,
-        },
-        rentals: {
-          currentPage: rentP,
-          limit: rentL,
-          totalRecords: rentTotal,
-          totalPages: Math.ceil(rentTotal / rentL) || 0,
-        },
-      },
-      counts: {
-        accommodations: accTotal,
-        services: svcTotal,
-        rentals: rentTotal,
-      },
-      data: {
-        accommodations,
-        services,
-        rentals,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Server Error 500:", error);
-    res.status(500).json({ success: false, message: error.message });
   }
 };
 

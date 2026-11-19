@@ -3,6 +3,61 @@ const AsyncErrorHandler = require("../Utils/AsyncErrorHandler");
 
 const Admin = require("../Models/AdminSchema")
 
+const axios = require("axios");
+const FormData = require("form-data");
+const fs = require("fs");
+
+
+const uploadToUploadAgta = async (file) => {
+  const form = new FormData();
+  form.append("file", fs.createReadStream(file.path), file.originalname);
+
+  try {
+    const response = await axios.post(process.env.UPLOADAGTA_URL, form, {
+      maxBodyLength: Infinity,
+      headers: { ...form.getHeaders() },
+    });
+
+    let uploaded = { url: "", public_id: "" };
+
+    if (response.data && response.data.url) {
+      uploaded = {
+        url: response.data.url,
+        public_id:
+          response.data.public_id ||
+          response.data.filename ||
+          file.filename,
+      };
+    } else if (response.data && response.data.success && response.data.data) {
+      uploaded = {
+        url: response.data.data.url,
+        public_id: response.data.data.public_id || file.filename,
+      };
+    } else if (response.data && response.data.file) {
+      uploaded = {
+        url: response.data.file,
+        public_id: file.filename,
+      };
+    } else {
+      uploaded = {
+        url: `/temp-uploads/${file.filename}`,
+        public_id: file.filename,
+      };
+    }
+
+    if (fs.existsSync(file.path)) {
+      fs.unlinkSync(file.path);
+    }
+
+    return uploaded;
+  } catch (err) {
+    if (fs.existsSync(file.path)) {
+      fs.unlinkSync(file.path);
+    }
+    throw err;
+  }
+};
+
 exports.getProfileData = AsyncErrorHandler(async (req, res) => {
   const userId = req.user.linkId;
 
@@ -61,6 +116,77 @@ exports.createCustomer = AsyncErrorHandler(async (req, res) => {
     message: "Customer created successfully",
     data: customer,
   });
+});
+
+
+exports.updateCustomerProfileAndId = AsyncErrorHandler(async (req, res) => {
+  try {
+    const {
+      first_name,
+      last_name,
+      middle_name,
+      suffix,
+      gender,
+    } = req.body;
+
+    const userId = req.user?.linkId || req.params?.id || req.user?._id;
+
+    console.log("userId", userId);
+
+    if (!userId) {
+      return res.status(400).json({
+        status: "fail",
+        message: "User ID is required.",
+      });
+    }
+
+    const customer = await Customer.findById(userId);
+    if (!customer) {
+      return res.status(404).json({
+        status: "fail",
+        message: "Customer not found.",
+      });
+    }
+
+    if (first_name !== undefined) customer.first_name = first_name;
+    if (last_name !== undefined) customer.last_name = last_name;
+    if (middle_name !== undefined) customer.middle_name = middle_name;
+    if (suffix !== undefined) customer.suffix = suffix;
+    if (gender === "Male" || gender === "Female") {
+      customer.gender = gender;
+    }
+
+    const avatarFile = req.files?.avatar?.[0] || req.file;
+    if (avatarFile) {
+      customer.avatar = await uploadToUploadAgta(avatarFile);
+    }
+
+    const frontFile = req.files?.validIdFront?.[0] || req.files?.front?.[0];
+    if (frontFile) {
+      customer.imageId = customer.imageId || {};
+      customer.imageId.front = await uploadToUploadAgta(frontFile);
+    }
+
+    const backFile = req.files?.validIdBack?.[0] || req.files?.back?.[0];
+    if (backFile) {
+      customer.imageId = customer.imageId || {};
+      customer.imageId.back = await uploadToUploadAgta(backFile);
+    }
+
+    await customer.save();
+
+    res.status(200).json({
+      status: "success",
+      message: "Customer profile updated successfully.",
+      data: customer,
+    });
+  } catch (error) {
+    console.error("updateCustomerProfileAndId error:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message || "Failed to update customer profile.",
+    });
+  }
 });
 
 // controllers/customerController.js

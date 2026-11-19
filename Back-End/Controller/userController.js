@@ -4,37 +4,37 @@ const user = require("../Models/usermodel");
 const Apifeatures = require("./../Utils/ApiFeatures");
 
 exports.createUser = AsyncErrorHandler(async (req, res) => {
-    const { FirstName,LastName, email, password} = req.body;
-  
-    // Check for required fields (except Middle if optional)
-    if (!FirstName || !LastName || !email || !password ) {
-      return res.status(400).json({
-        status: "fail",
-        message: "Please fill in all required fields.",
-      });
-    }
-  
-  
-    // Optional: validate email format
-    const isValidEmail = /\S+@\S+\.\S+/.test(email);
-    if (!isValidEmail) {
-      return res.status(400).json({
-        status: "fail",
-        message: "Please provide a valid email address.",
-      });
-    }
-  
-    // Create user
-    const newUser = await user.create(req.body);
-    console.log("Text",newUser)
-  
-    // Respond
-    res.status(201).json({
-      status: "success",
-      data: newUser,
+  const { FirstName, LastName, email, password } = req.body;
+
+  // Check for required fields (except Middle if optional)
+  if (!FirstName || !LastName || !email || !password) {
+    return res.status(400).json({
+      status: "fail",
+      message: "Please fill in all required fields.",
     });
+  }
+
+
+  // Optional: validate email format
+  const isValidEmail = /\S+@\S+\.\S+/.test(email);
+  if (!isValidEmail) {
+    return res.status(400).json({
+      status: "fail",
+      message: "Please provide a valid email address.",
+    });
+  }
+
+  // Create user
+  const newUser = await user.create(req.body);
+  console.log("Text", newUser)
+
+  // Respond
+  res.status(201).json({
+    status: "success",
+    data: newUser,
   });
-  
+});
+
 
 exports.DisplayAll = AsyncErrorHandler(async (req, res) => {
   try {
@@ -92,12 +92,12 @@ exports.deleteUser = AsyncErrorHandler(async (req, res) => {
 });
 
 exports.Updateuser = AsyncErrorHandler(async (req, res, next) => {
-    const { FirstName, LastName, email,role} =
+  const { FirstName, LastName, email, role } =
     req.body;
   if (
     !FirstName ||
     !LastName ||
-    !email||
+    !email ||
     !role
   ) {
     return res.status(400).json({
@@ -149,7 +149,7 @@ exports.updatePassword = AsyncErrorHandler(async (req, res, next) => {
 });
 
 exports.signup = AsyncErrorHandler(async (req, res, next) => {
-  const { FirstName, Middle, LastName, email, password,role } = req.body;
+  const { FirstName, Middle, LastName, email, password, role } = req.body;
   user
     .findOne({ email: email })
     .then((user) => {
@@ -162,7 +162,7 @@ exports.signup = AsyncErrorHandler(async (req, res, next) => {
           LastName: LastName,
           email: email,
           password: password,
-          role:role
+          role: role
         })
           .then((result) => res.json(result))
 
@@ -171,3 +171,5 @@ exports.signup = AsyncErrorHandler(async (req, res, next) => {
     })
     .catch((err) => res.json(err));
 });
+
+

@@ -27,6 +27,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
       first_name,
       last_name,
       middle_name,
+      suffix,
       email,
       role,
       gender,
@@ -128,7 +129,7 @@ exports.signup = AsyncErrorHandler(async (req, res) => {
     //  Create profile + user login in parallel (walang dependency sa isa't isa maliban sa linkedId)
     //    Kaya: gumawa muna ng profile, tapos login — pero gamitin ang lean/create options
     const linkedRecord = await (selectedRole === "customer" || selectedRole === "patient"
-      ? Customer.create({ avatar, ...profilePayload })
+      ? Customer.create({ avatar, ...profilePayload, suffix })
       : Admin.create({ avatar, ...profilePayload }));
 
     const newUserLogin = await UserLogin.create({

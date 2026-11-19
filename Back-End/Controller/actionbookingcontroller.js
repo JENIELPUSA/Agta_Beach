@@ -4,7 +4,7 @@ const UserLoginSchema = require("../Models/LogInDentalSchema");
 const Order = require("../Models/OrderSchema");
 const ActionBooking = require("../Models/ActionBooking");
 const Customer = require("../Models/CustomerSchema");
-const HistorySchema= require("../Models/BillingHistorySchema")
+const HistorySchema = require("../Models/BillingHistorySchema")
 const mongoose = require("mongoose");
 
 // =====================================
@@ -73,13 +73,18 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
   const userId = req.user?._id;
   const role = req.user?.role;
 
+  // =========================
+  // ✅ EXCLUDE isDone === true (finished bookings/orders)
+  // =========================
   const bookingMatch = {
     status: "Confirmed",
+    isDone: { $ne: true }, // ✅ skip finished bookings
   };
 
   const orderMatch = {
     status: "completed",
     "payment.status": { $ne: "paid" },
+    isDone: { $ne: true }, // ✅ skip finished orders (if Order schema has isDone)
   };
 
   // =========================
@@ -121,27 +126,17 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     });
   }
 
-  console.log("📋 Booking Match:", JSON.stringify(bookingMatch, null, 2));
-  console.log("📋 Order Match:", JSON.stringify(orderMatch, null, 2));
-
-  // =========================
-  // PRE-AGGREGATION CHECK (DEBUG)
-  // =========================
   const rawBookingCount = await ActionBooking.countDocuments({
     status: "Confirmed",
+    isDone: { $ne: true },
   });
-  console.log(`📊 Confirmed bookings: ${rawBookingCount}`);
 
   const rawOrderCount = await Order.countDocuments({
     status: "completed",
     "payment.status": { $ne: "paid" },
+    isDone: { $ne: true },
   });
-  console.log(`📊 Raw orders (completed & not paid): ${rawOrderCount}`);
 
-  // =========================
-  // BOOKINGS AGGREGATION
-  // =========================
-  console.log("📚 ===== FETCHING CONFIRMED BOOKINGS =====");
 
   const bookings = await ActionBooking.aggregate([
     { $match: bookingMatch },
@@ -269,7 +264,9 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                   {
                     $or: [
                       { $in: ["$$bookingNumber", "$bookings.bookingNumber"] },
-                      { $eq: ["$bookings.bookingNumber", "$$bookingNumber"] },
+                      {
+                        $eq: ["$bookings.bookingNumber", "$$bookingNumber"],
+                      },
                       { $eq: ["$bookings._id", "$$bookingId"] },
                       { $eq: ["$bookings.bookingItemId", "$$itemId"] },
                       { $in: ["$$bookingNumber", "$bookings.referenceNo"] },
@@ -279,7 +276,12 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
                   {
                     $or: [
                       { $eq: ["$status", "partial"] },
-                      { $eq: ["$paymentDetails.paymentType", "partial"] },
+                      {
+                        $eq: [
+                          "$paymentDetails.paymentType",
+                          "partial",
+                        ],
+                      },
                     ],
                   },
                 ],
@@ -884,7 +886,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         hasPartial: 1,
         hasFullyPaid: 1,
 
-        // ✅ NEW fields (Bookings won't have them, so we set defaults)
         orderType: { $literal: null },
         deliveryLocation: { $literal: null },
       },
@@ -1080,7 +1081,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
 
     {
       $addFields: {
-        // ✅ NEW: normalize new fields with fallbacks for legacy orders
         resolvedCustomerName: {
           $ifNull: ["$customerName", "$user.name"],
         },
@@ -1248,7 +1248,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
         hasPartial: 1,
         hasFullyPaid: 1,
 
-        // ✅ NEW FIELDS
         orderType: {
           $ifNull: ["$orderType", "$delivery.type", "dine-in"],
         },
@@ -1300,7 +1299,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
     return acc;
   }, {});
 
-  // ✅ NEW: breakdown ng orders by orderType
   const orderTypeCounts = orders.reduce((acc, item) => {
     const key = item.orderType || "unknown";
     acc[key] = (acc[key] || 0) + 1;
@@ -1315,8 +1313,6 @@ exports.getMyBilling = AsyncErrorHandler(async (req, res) => {
       grandTotal: bookingTotal + orderTotal,
       totalBookings: bookings.length,
       totalOrders: orders.length,
-
-      // ✅ NEW
       orderTypeCounts,
     },
     statusSummary: {
@@ -1918,23 +1914,15 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
       // 1B. NEW WALK-IN (walang userId)
       // =====================================
       else {
-        // ─────────────────────────────────────
-        // ✅ WALK-IN: WALANG EMAIL/PASSWORD NA REQUIRED
-        //    (receptionist lang ang role na ito)
-        // ─────────────────────────────────────
         console.log(
           `ℹ️ Walk-in booking by ${role} — skipping email/password requirement`
         );
 
-        // ─────────────────────────────────────
-        // 1B-1. Create Customer profile (NO email required)
-        // ─────────────────────────────────────
         const customer = await Customer.create({
           first_name: first_name || "Walk-in",
           last_name: last_name || "Guest",
           middle_name: middle_name || "",
           suffix: suffix || "",
-          // ✅ Optional ang email — kung meron, gamitin; kung wala, blanko
           ...(email && email.trim() ? { email: email.toLowerCase().trim() } : {}),
           avatar: {
             url: "",
@@ -1947,16 +1935,12 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
           `✅ Created walk-in customer: ${first_name || "Walk-in"} ${last_name || "Guest"} (${customerId})`
         );
 
-        // ─────────────────────────────────────
-        // 1B-2. Create UserLogin account
-        // ─────────────────────────────────────
         if (shouldCreateUser) {
           const existingUser = await UserLoginSchema.findOne({
             linkedId: customerId,
           });
 
           if (!existingUser) {
-            // ✅ Generira ng placeholder email/username kung walang binigay
             const placeholderEmail =
               email && email.trim()
                 ? email.toLowerCase().trim()
@@ -1965,7 +1949,7 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
             const placeholderPassword =
               password && password.length >= 6
                 ? password
-                : `walkin_${Date.now()}_temp`; // default temp password
+                : `walkin_${Date.now()}_temp`;
 
             console.log("🔐 Creating walk-in UserLoginSchema with:", {
               email: placeholderEmail,
@@ -1986,45 +1970,19 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
               username: placeholderEmail,
               role: "customer",
               linkedId: customerId,
-              isVerified: false, // hindi verified dahil hindi naka-register
+              isVerified: false,
             });
 
             guestUserId = newUser._id;
 
-            // =====================================
-            // 🔍 VERIFY
-            // =====================================
             const verifyUser = await UserLoginSchema.findById(newUser._id)
               .select("+password")
               .lean();
 
-            console.log("=".repeat(60));
-            console.log("✅ WALK-IN USER CREATED — VERIFICATION");
-            console.log("=".repeat(60));
-            console.log("📧 email:", verifyUser?.email);
-            console.log("👤 username:", verifyUser?.username);
-            console.log(
-              "🔑 password:",
-              verifyUser?.password
-                ? `✅ HASHED (${verifyUser.password.substring(0, 15)}...)`
-                : "❌ MISSING"
-            );
-            console.log("🎭 role:", verifyUser?.role);
-            console.log("🔗 linkedId:", verifyUser?.linkedId);
-            console.log("=".repeat(60));
           } else {
-            console.log(
-              `👤 Guest already has user account: ${existingUser.username}`
-            );
             guestUserId = existingUser._id;
           }
         } else {
-          // Rental / Service — temporary user lang
-          console.log(
-            `ℹ️ No full user account created for ${bookingItemModel} booking`
-          );
-
-          // ✅ Placeholder din para sa temp user
           const placeholderEmail =
             email && email.trim()
               ? email.toLowerCase().trim()
@@ -2059,23 +2017,48 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
     // 2. NON-RECEPTIONIST (regular user)
     // =====================================
     else {
-      customerId = req.body.userId || req.body.customerId;
+      const targetUserId = req.body.userId || req.body.customerId || req.user?._id;
       isWalkin = false;
 
-      const user = await UserLoginSchema.findById(customerId);
+      const user = await UserLoginSchema.findById(targetUserId);
       if (!user) {
         return res.status(404).json({
           success: false,
           message: "User not found",
         });
       }
-      guestUserId = customerId;
+
+      const linkedCustomerId = user.linkedId || req.user?.linkId;
+      const customer = linkedCustomerId
+        ? await Customer.findById(linkedCustomerId).lean()
+        : null;
+
+      const frontIdUrl =
+        customer?.imageId?.front?.url ||
+        (typeof customer?.imageId?.front === "string"
+          ? customer.imageId.front
+          : "");
+      const backIdUrl =
+        customer?.imageId?.back?.url ||
+        (typeof customer?.imageId?.back === "string"
+          ? customer.imageId.back
+          : "");
+
+      if (!customer || !frontIdUrl.trim() || !backIdUrl.trim()) {
+        return res.status(403).json({
+          success: false,
+          code: "MISSING_VALID_ID",
+          message:
+            "Please upload both the front and back of your valid ID before creating a booking.",
+        });
+      }
+
+      customerId = linkedCustomerId;
+      guestUserId = user._id;
     }
 
     // =====================================
     // 3. DETERMINE BOOKING STATUS
-    //    ✅ FIXED: Lahat ng bagong booking ay "Pending"
-    //    (i-approve via updateBookingStatus ng admin/receptionist)
     // =====================================
     const bookingStatus = "Pending";
     console.log(
@@ -2360,10 +2343,10 @@ exports.createBooking = AsyncErrorHandler(async (req, res) => {
         responseData.customerInfo = {
           customerId: customerId,
           name: `${first_name || "Walk-in"} ${last_name || "Guest"}`,
-          email: email || null, // ✅ optional — puwedeng null
+          email: email || null,
           bookingType: bookingItemModel,
           hasUserAccount: shouldCreateUser,
-          username: null, // walk-in walang username
+          username: null,
           isWalkin: true,
           expected_stay: expected_stay || 1,
           checkIn: finalCheckIn,
@@ -2531,15 +2514,6 @@ exports.updateBookingStatus = AsyncErrorHandler(async (req, res) => {
       updateData.unitPrice = unitPrice;
       updateData.isWeekend = isWeekend;
       updateData.totalPrice = totalPrice;
-
-      console.log(
-        "💰 Recomputed — unitPrice:",
-        unitPrice,
-        "| isWeekend:",
-        isWeekend,
-        "| totalPrice:",
-        totalPrice
-      );
     }
 
     // =========================

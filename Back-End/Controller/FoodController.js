@@ -17,8 +17,6 @@ exports.createFood = AsyncErrorHandler(async (req, res) => {
         status,
     } = req.body;
 
-    console.log("TRigger!!");
-
     // Validate required fields
     if (!name || !price) {
         return res.status(400).json({
@@ -27,11 +25,34 @@ exports.createFood = AsyncErrorHandler(async (req, res) => {
         });
     }
 
-    let avatar = { url: "", public_id: "" };
+    const userRole = req.user?.role?.toLowerCase()?.trim();
+    if (userRole === "customer") {
+        const customerId = req.user?.linkId || req.user?._id;
+        const customer = customerId
+            ? await Customer.findById(customerId)
+            : null;
 
-    // ============================================
-    // IMAGE UPLOAD SA UPLOADAGTA
-    // ============================================
+        const frontIdUrl =
+            customer?.imageId?.front?.url ||
+            (typeof customer?.imageId?.front === "string"
+                ? customer.imageId.front
+                : "");
+        const backIdUrl =
+            customer?.imageId?.back?.url ||
+            (typeof customer?.imageId?.back === "string"
+                ? customer.imageId.back
+                : "");
+
+        if (!customer || !frontIdUrl.trim() || !backIdUrl.trim()) {
+            return res.status(403).json({
+                status: "fail",
+                message:
+                    "Please upload both the front and back of your valid ID before creating a food item.",
+            });
+        }
+    }
+
+    let avatar = { url: "", public_id: "" };
     if (req.file) {
         console.log("📸 Uploading image to UPLOADAGTA...");
         console.log("📁 File:", {
@@ -507,3 +528,5 @@ const deleteImageFromServer = async (publicId, imageUrl) => {
         return { success: false, message: err.message };
     }
 };
+
+
